@@ -1,0 +1,8 @@
+xmp/toolkit/XMPFiles/build
+xmp/toolkit/XMPCore/build
+libjxl/client_projects/mac/build
+dng_sdk/projects/mac/build
+**/xcuserdata
+*.xcworkspace
+dng_sdk/targets
+xmp/toolkit/public/libraries
