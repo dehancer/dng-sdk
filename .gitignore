@@ -6,3 +6,5 @@ dng_sdk/projects/mac/build
 *.xcworkspace
 dng_sdk/targets
 xmp/toolkit/public/libraries
+dng_validate_*
+dng_render
