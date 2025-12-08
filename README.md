@@ -26,6 +26,8 @@ cp $destination_dir/dng_validate dns_validate_arm64
 xcodebuild $common_options ARCHS="x86_64" build
 cp $destination_dir/dng_validate dns_validate_x86_64
 
+strip -S dng_validate_{arm64,x86_64} # because we don't want to ship symbols
+
 lipo dng_validate_{arm64,x86_64} -create -output dng_render
 ```
 
