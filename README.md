@@ -15,15 +15,15 @@ Please make sure the commit history is extra clean so that we can update DNG SDK
 ## macOS
 
 ```bash
-common_options="-project dng_sdk/projects/mac/dng_validate.xcodeproj -scheme dng_validate\ release -configuration Release"
+common_options="-project dng_sdk/projects/mac/dng_validate.xcodeproj -configuration Release"
 
 destination_dir=dng_sdk/targets/mac/release64
 rm -rf $destination_dir # just in case
 
-xcodebuild $common_options ARCHS="arm64" build
+xcodebuild $common_options -scheme dng_validate\ release ARCHS="arm64" build
 cp $destination_dir/dng_validate dns_validate_arm64
 
-xcodebuild $common_options ARCHS="x86_64" build
+xcodebuild $common_options -scheme dng_validate\ release ARCHS="x86_64" build
 cp $destination_dir/dng_validate dns_validate_x86_64
 
 strip -S dng_validate_{arm64,x86_64} # because we don't want to ship symbols
