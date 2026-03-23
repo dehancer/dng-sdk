@@ -29,6 +29,8 @@ if(DNG_WITH_XMP)
     find_package(EXPAT REQUIRED)
 endif()
 
+find_package(OpenMP REQUIRED)
+
 # JPEG-XL is required and the libjxl-dev typically doesn't provide a CMake config file.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JXL REQUIRED libjxl)
@@ -271,6 +273,8 @@ foreach(TARGET IN ITEMS ${TARGETS})
     target_include_directories(${TARGET} PRIVATE ${JXL_INCLUDE_DIRS})
     target_link_libraries(${TARGET} PRIVATE ${JXL_LIBRARIES})
     target_link_libraries(${TARGET} PRIVATE ${JXL_THREADS_LIBRARIES})
+
+    target_link_libraries(${TARGET} PRIVATE OpenMP::OpenMP_CXX)
 
     target_compile_options(${TARGET} PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overflow>)
     if(ANDROID)
