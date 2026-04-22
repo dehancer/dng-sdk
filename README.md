@@ -8,6 +8,8 @@ Please make sure the commit history is extra clean so that we can update DNG SDK
 
 `.gitignore` is exclusive to this repository and is not present in original zip file.
 
+`xmp/toolkit/third-party/zuid/interfaces/MD5.cpp` is only present in this repository.
+
 # Build instructions for Windows and macOS
 
 See build scripts in `dehancer-ci` repo in `windows/` and `macos/` folders.
