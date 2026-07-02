@@ -222,7 +222,7 @@ dng_string dng_fingerprint::ToUtf8HexString () const
 
 /******************************************************************************/
 
-static int HexCharToNum (char hexChar)
+int dng_fingerprint::HexCharToNum (char hexChar)
 	{
 	
 	if (hexChar >= '0' && hexChar <= '9')
@@ -310,14 +310,20 @@ dng_string dng_fingerprint::ToUtf8ClosestUUIDString () const
 
 bool dng_fingerprint::FromUtf8HexString (const dng_string &inputStr)
 	{
-	
+
+	// CR-4208475 N-L16: preserve the legacy dng_string overload contract:
+	// callers may pass a longer string and this parser consumes the first
+	// 32 hex characters. This prefix behavior is not memory-unsafe, and
+	// changing it to exact-length rejection is a compatibility risk for
+	// existing clients that may carry adjacent metadata in the same string.
+
 	if (inputStr.Length () < kDNGFingerprintSize * 2)
 		{
 		return false;
 		}
 
 	return FromUtf8HexString (inputStr.Get ());
-	
+
 	}
 
 /******************************************************************************/

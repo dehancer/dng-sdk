@@ -11,6 +11,8 @@
 #include "dng_exceptions.h"
 #include "dng_flags.h"
 
+#include <limits>
+
 #if qAndroid
 #include <unistd.h>
 #endif
@@ -213,7 +215,19 @@ uint64 dng_file_stream::DoGetLength ()
 
 		}
 
-	return (uint64) _ftelli64 (fFile);
+	// CR-4208475 K-L2: Treat tell failures as read errors before
+	// widening the position into the unsigned stream-length domain.
+
+	const auto position = _ftelli64 (fFile);
+
+	if (position < 0)
+		{
+
+		ThrowReadFile ();
+
+		}
+
+	return (uint64) position;
 
 	#else
 
@@ -224,7 +238,19 @@ uint64 dng_file_stream::DoGetLength ()
 
 		}
 
-	return (uint64) ftello (fFile);
+	// CR-4208475 K-L2: Treat tell failures as read errors before
+	// widening the position into the unsigned stream-length domain.
+
+	const auto position = ftello (fFile);
+
+	if (position < 0)
+		{
+
+		ThrowReadFile ();
+
+		}
+
+	return (uint64) position;
 
 	#endif
 	
@@ -232,11 +258,33 @@ uint64 dng_file_stream::DoGetLength ()
 		
 /*****************************************************************************/
 
+static bool dng_file_stream_offset_fits_seek (uint64 offset)
+	{
+
+	#if qWinOS
+
+	return offset <= 0x7FFFFFFFFFFFFFFFull;
+
+	#else
+
+	return offset <= (uint64) std::numeric_limits<off_t>::max ();
+
+	#endif
+
+	}
+
+/*****************************************************************************/
+
 void dng_file_stream::DoRead (void *data,
 							  uint32 count,
 							  uint64 offset)
 	{
 	
+	if (!dng_file_stream_offset_fits_seek (offset))
+		{
+		ThrowReadFile ();
+		}
+
 	#if qWinOS
 
 	if (_fseeki64 (fFile, (int64) offset, SEEK_SET) != 0)
@@ -270,6 +318,11 @@ void dng_file_stream::DoWrite (const void *data,
 							   uint64 offset)
 	{
 	
+	if (!dng_file_stream_offset_fits_seek (offset))
+		{
+		ThrowWriteFile ();
+		}
+
 	#if qWinOS
 
 	if (_fseeki64 (fFile, (int64) offset, SEEK_SET) != 0)

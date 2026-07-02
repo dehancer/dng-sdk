@@ -22,6 +22,48 @@
 
 /*****************************************************************************/
 
+static bool ApplyOffsetDelta (uint64 offset,
+							  int64 offsetDelta,
+							  uint64 *adjustedOffset)
+	{
+
+	if (offsetDelta >= 0)
+		{
+
+		const uint64 positiveDelta = (uint64) offsetDelta;
+
+		if (offset > 0xFFFFFFFFFFFFFFFFull - positiveDelta)
+			{
+			return false;
+			}
+
+		*adjustedOffset = offset + positiveDelta;
+
+		}
+
+	else
+		{
+
+		// CR-4208475 L-M1: Avoid relying on unsigned wrap when applying
+		// relative MakerNote/TIFF offset deltas parsed from file data.
+
+		const uint64 negativeDelta = (uint64) (-(offsetDelta + 1)) + 1;
+
+		if (offset < negativeDelta)
+			{
+			return false;
+			}
+
+		*adjustedOffset = offset - negativeDelta;
+
+		}
+
+	return true;
+
+	}
+
+/*****************************************************************************/
+
 dng_info::dng_info ()
 
 	:	fTIFFBlockOffset		 (0)
@@ -455,8 +497,11 @@ bool dng_info::ValidateIFD (dng_stream &stream,
 			uint64 tagOffset = isBigTIFF ? stream.Get_uint64 ()
 										 : stream.Get_uint32 ();
 							
-			tagOffset += offsetDelta;
-			
+			if (!ApplyOffsetDelta (tagOffset, offsetDelta, &tagOffset))
+				{
+				return false;
+				}
+
 			if (SafeUint64Add (tagOffset,
 							   tag_data_size) > stream.Length ())
 				{
@@ -508,7 +553,24 @@ void dng_info::ParseIFD (dng_host &host,
 	
 	uint64 ifdEntries = isBigTIFF ? ifdStream.Get_uint64 ()
 								  : ifdStream.Get_uint16 ();
-	
+
+	// CR-4208475 N-M2: bound the per-entry stride and post-loop NextIFD
+	// arithmetic before the per-iteration SetReadPosition derivations run.
+	// For BigTIFF, ifdEntries comes from a uint64 file value and is
+	// otherwise unbounded; without this preflight, ifdEntries * 20 (or
+	// * 12) and the ifdOffset addition can wrap. Mirrors the bound that
+	// dng_info::ValidateIFD applies for the same span.
+
+	const uint64 kEntryStride  = isBigTIFF ? 20 : 12;
+	const uint64 kEntryHeader  = isBigTIFF ?  8 :  2;
+	const uint64 kNextIFDBytes = isBigTIFF ?  8 :  4;
+	const uint64 kMaxUint64    = ~uint64 (0);
+
+	if (ifdEntries > (kMaxUint64 - kEntryHeader - kNextIFDBytes) / kEntryStride)
+		{
+		ThrowBadFormat ();
+		}
+
 	#if qDNGValidate
 		
 	bool generateOddOffsetWarnings = !gImagecore;
@@ -544,9 +606,14 @@ void dng_info::ParseIFD (dng_host &host,
 		
 	for (uint64 tag_index = 0; tag_index < ifdEntries; tag_index++)
 		{
-		
-		ifdStream.SetReadPosition (isBigTIFF ? ifdOffset + 8 + tag_index * 20
-											 : ifdOffset + 2 + tag_index * 12);
+
+		// CR-4208475 N-M2: preflight above ensures tag_index * kEntryStride
+		// fits in uint64; route the ifdOffset addition through SafeUint64Add
+		// so a pathological ifdOffset still cannot wrap the read position.
+
+		ifdStream.SetReadPosition (SafeUint64Add (ifdOffset,
+												  kEntryHeader,
+												  tag_index * kEntryStride));
 		
 		uint32 tagCode	= ifdStream.Get_uint16 ();
 		uint32 tagType	= ifdStream.Get_uint16 ();
@@ -679,11 +746,51 @@ void dng_info::ParseIFD (dng_host &host,
 				
 			#endif
 				
-			tagOffset += offsetDelta;
+			if (!ApplyOffsetDelta (tagOffset, offsetDelta, &tagOffset))
+				{
+				ThrowBadFormat ("tag offset adjustment overflow");
+				}
 
 			if (SafeUint64Add (tagOffset, tag_data_size) > stream.Length ())
 				{
-				ThrowBadFormat ("tag payload past stream end");
+
+				// Throw unless this is a known case to ignore bad tags:
+				// 1. EXIF IFD — vendor cameras may write proprietary
+				//    tags with over-declared sizes here.
+				// 2. IFD 0 tag 50457 (0xC519) — Phocus may write
+				//    this with an inflated byte count past EOF for
+				//    some FFF files.
+
+				if (parentCode != tcExifIFD &&
+					!(parentCode == 0 && tagCode == 0xC519))
+					{
+
+					ThrowBadFormat ("tag payload past stream end");
+
+					}
+
+				#if qDNGValidate
+
+					{
+
+					char message [256];
+
+					snprintf (message,
+							  256,
+							  "%s %s payload extends past stream end (offset=%llu, size=%llu); skipping",
+							  LookupParentCode (parentCode),
+							  LookupTagCode (parentCode, tagCode),
+							  (unsigned long long) tagOffset,
+							  (unsigned long long) tag_data_size);
+
+					ReportWarning (message);
+
+					}
+
+				#endif
+
+				continue;
+
 				}
 
 			localTag = ifdStream.DataInBuffer (tag_data_size,
@@ -738,8 +845,9 @@ void dng_info::ParseIFD (dng_host &host,
 			
 		}
 		
-	ifdStream.SetReadPosition (isBigTIFF ? ifdOffset + 8 + ifdEntries * 20
-										 : ifdOffset + 2 + ifdEntries * 12);
+	ifdStream.SetReadPosition (SafeUint64Add (ifdOffset,
+											  kEntryHeader,
+											  ifdEntries * kEntryStride));
 	
 	uint64 nextIFD = isBigTIFF ? ifdStream.Get_uint64 ()
 							   : ifdStream.Get_uint32 ();
@@ -930,7 +1038,12 @@ bool dng_info::ParseMakerNoteIFD (dng_host &host,
 		if (tagSize > 4)
 			{
 			
-			tagOffset = ifdStream.Get_uint32 () + offsetDelta;
+			if (!ApplyOffsetDelta (ifdStream.Get_uint32 (),
+								   offsetDelta,
+								   &tagOffset))
+				{
+				continue;
+				}
 
 			try
 				{
@@ -1008,8 +1121,15 @@ bool dng_info::ParseMakerNoteIFD (dng_host &host,
 				
 				stream.SetReadPosition (tagOffset);
 			
-				uint64 subMakerNoteOffset = stream.Get_uint32 () + offsetDelta;
-				
+				uint64 subMakerNoteOffset = 0;
+
+				if (!ApplyOffsetDelta (stream.Get_uint32 (),
+									   offsetDelta,
+									   &subMakerNoteOffset))
+					{
+					continue;
+					}
+
 				if (subMakerNoteOffset >= minOffset &&
 					subMakerNoteOffset <  maxOffset)
 					{
@@ -1098,8 +1218,13 @@ void dng_info::ParseMakerNote (dng_host &host,
 	
 	if (memcmp (firstBytes, "Apple iOS", 9) == 0)
 		{
+
+		if (makerNoteCount < 14)
+			{
+			return;
+			}
 		
-		stream.SetReadPosition (makerNoteOffset + 12);
+		stream.SetReadPosition (SafeUint64Add (makerNoteOffset, 12));
 		
 		bool bigEndian = false;
 		
@@ -1123,7 +1248,7 @@ void dng_info::ParseMakerNote (dng_host &host,
 			ParseMakerNoteIFD (host,
 							   stream,
 							   makerNoteCount - 14,
-							   makerNoteOffset + 14,
+							   SafeUint64Add (makerNoteOffset, 14),
 							   makerNoteOffset,
 							   minOffset,
 							   maxOffset,
@@ -1162,8 +1287,13 @@ void dng_info::ParseMakerNote (dng_host &host,
 	
 	if (memcmp (firstBytes, "FUJIFILM", 8) == 0)
 		{
+
+		if (makerNoteCount < 12)
+			{
+			return;
+			}
 		
-		stream.SetReadPosition (makerNoteOffset + 8);
+		stream.SetReadPosition (SafeUint64Add (makerNoteOffset, 8));
 		
 		TempLittleEndian tempEndian (stream);
 		
@@ -1175,7 +1305,7 @@ void dng_info::ParseMakerNote (dng_host &host,
 			ParseMakerNoteIFD (host,
 							   stream,
 							   makerNoteCount - ifd_offset,
-							   makerNoteOffset + ifd_offset,
+							   SafeUint64Add (makerNoteOffset, ifd_offset),
 							   makerNoteOffset,
 							   minOffset,
 							   maxOffset,
@@ -1300,8 +1430,13 @@ void dng_info::ParseMakerNote (dng_host &host,
 	
 	if (memcmp (firstBytes, "OLYMPUS\000", 8) == 0)
 		{
+
+		if (makerNoteCount < 12)
+			{
+			return;
+			}
 		
-		stream.SetReadPosition (makerNoteOffset + 8);
+		stream.SetReadPosition (SafeUint64Add (makerNoteOffset, 8));
 		
 		bool bigEndian = false;
 		
@@ -1332,7 +1467,7 @@ void dng_info::ParseMakerNote (dng_host &host,
 			ParseMakerNoteIFD (host,
 							   stream,
 							   makerNoteCount - 12,
-							   makerNoteOffset + 12,
+							   SafeUint64Add (makerNoteOffset, 12),
 							   makerNoteOffset,
 							   minOffset,
 							   maxOffset,
@@ -1373,8 +1508,13 @@ void dng_info::ParseMakerNote (dng_host &host,
 	
 	if (memcmp (firstBytes, "OM SYSTEM\000", 10) == 0)
 		{
+
+		if (makerNoteCount < 16)
+			{
+			return;
+			}
 		
-		stream.SetReadPosition (makerNoteOffset + 12);
+		stream.SetReadPosition (SafeUint64Add (makerNoteOffset, 12));
 		
 		bool bigEndian = false;
 		
@@ -1405,7 +1545,7 @@ void dng_info::ParseMakerNote (dng_host &host,
 			ParseMakerNoteIFD (host,
 							   stream,
 							   makerNoteCount - 16,
-							   makerNoteOffset + 16,
+							   SafeUint64Add (makerNoteOffset, 16),
 							   makerNoteOffset,
 							   minOffset,
 							   maxOffset,
@@ -1486,10 +1626,13 @@ void dng_info::ParseMakerNote (dng_host &host,
 	if (memcmp (firstBytes, "PENTAX", 6) == 0)
 		{
 		
-		if (makerNoteCount > 8)
+		// CR-4208475 K-M1: Require the full relative MakerNote header
+		// before subtracting the nested IFD offset.
+
+		if (makerNoteCount >= 10)
 			{
 					
-			stream.SetReadPosition (makerNoteOffset + 8);
+			stream.SetReadPosition (SafeUint64Add (makerNoteOffset, 8));
 			
 			bool bigEndian = stream.BigEndian ();
 			
@@ -1510,7 +1653,7 @@ void dng_info::ParseMakerNote (dng_host &host,
 			ParseMakerNoteIFD (host,
 							   stream,
 							   makerNoteCount - 10,
-							   makerNoteOffset + 10,
+							   SafeUint64Add (makerNoteOffset, 10),
 							   makerNoteOffset,		// Relative to start of MakerNote.
 							   minOffset,
 							   maxOffset,
@@ -1644,28 +1787,72 @@ void dng_info::ParseMakerNote (dng_host &host,
 	if (fExif->fMake.StartsWith ("Mamiya"))
 		{
 		
-		ParseMakerNoteIFD (host,
-						   stream,
-						   makerNoteCount,
-						   makerNoteOffset,
-						   offsetDelta,
-						   minOffset,
-						   maxOffset,
-						   tcMamiyaMakerNote);
+		if (!ParseMakerNoteIFD (host,
+								stream,
+								makerNoteCount,
+								makerNoteOffset,
+								offsetDelta,
+								minOffset,
+								maxOffset,
+								tcMamiyaMakerNote))
+			{
+			return;
+			}
 						   
 		// Mamiya uses a MakerNote chain.
-						   
+
+		uint64 visitedOffsets [kMaxChainedIFDs];
+		uint32 visitedCount = 0;
+
+		visitedOffsets [visitedCount++] = makerNoteOffset;
+
 		while (fMakerNoteNextIFD)
 			{
-						   
-			ParseMakerNoteIFD (host,
-							   stream,
-							   makerNoteCount,
-							   offsetDelta + fMakerNoteNextIFD,
-							   offsetDelta,
-							   minOffset,
-							   maxOffset,
-							   tcMamiyaMakerNote);
+
+			if (visitedCount >= kMaxChainedIFDs)
+				{
+				ThrowBadFormat ("Mamiya MakerNote chain too long");
+				}
+
+			uint64 nextIFDOffset = 0;
+
+			if (!ApplyOffsetDelta (fMakerNoteNextIFD,
+								   offsetDelta,
+								   &nextIFDOffset))
+				{
+				ThrowBadFormat ("Invalid Mamiya MakerNote chain offset");
+				}
+
+			if (nextIFDOffset < minOffset ||
+				nextIFDOffset >= maxOffset)
+				{
+				ThrowBadFormat ("Mamiya MakerNote chain out of bounds");
+				}
+
+			for (uint32 index = 0; index < visitedCount; index++)
+				{
+
+				if (visitedOffsets [index] == nextIFDOffset)
+					{
+					ThrowBadFormat ("Mamiya MakerNote chain cycle");
+					}
+
+				}
+
+			visitedOffsets [visitedCount++] = nextIFDOffset;
+
+			if (!ParseMakerNoteIFD (host,
+									stream,
+									Min_uint64 (makerNoteCount,
+												maxOffset - nextIFDOffset),
+									nextIFDOffset,
+									offsetDelta,
+									minOffset,
+									maxOffset,
+									tcMamiyaMakerNote))
+				{
+				ThrowBadFormat ("Invalid Mamiya MakerNote chain");
+				}
 							   
 			}
 						   
@@ -1711,14 +1898,18 @@ void dng_info::ParseMakerNote (dng_host &host,
 	
 	// Casio MakerNote.
 	
+	// CR-4208475 K-M1: The zero-padded header check can match short
+	// payloads, so require the nested offset bytes explicitly.
+
 	if (fExif->fMake.StartsWith ("CASIO COMPUTER") &&
+		makerNoteCount >= 6 &&
 		memcmp (firstBytes, "QVC\000\000\000", 6) == 0)
 		{
 		
 		ParseMakerNoteIFD (host,
 						   stream,
 						   makerNoteCount - 6,
-						   makerNoteOffset + 6,
+						   SafeUint64Add (makerNoteOffset, 6),
 						   makerNoteOffset,
 						   minOffset,
 						   maxOffset,
@@ -1791,7 +1982,20 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 			
 		#endif
 
-		stream.SetReadPosition (fShared->fDNGPrivateDataOffset + 8);
+		// CR-4208475 K-M1: Keep private MakerNote parsing inside the
+		// declared DNGPrivateData payload.
+
+		if (fShared->fDNGPrivateDataCount < 10)
+			{
+			return;
+			}
+
+		const uint64 privateDataEnd =
+			SafeUint64Add (fShared->fDNGPrivateDataOffset,
+						   fShared->fDNGPrivateDataCount);
+
+		stream.SetReadPosition
+			(SafeUint64Add (fShared->fDNGPrivateDataOffset, 8));
 		
 		bool bigEndian = stream.BigEndian ();
 		
@@ -1812,10 +2016,10 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 		ParseMakerNoteIFD (host,
 						   stream,
 						   fShared->fDNGPrivateDataCount - 10,
-						   fShared->fDNGPrivateDataOffset + 10,
+						   SafeUint64Add (fShared->fDNGPrivateDataOffset, 10),
 						   fShared->fDNGPrivateDataOffset,
 						   fShared->fDNGPrivateDataOffset,
-						   fShared->fDNGPrivateDataOffset + fShared->fDNGPrivateDataCount,
+						   privateDataEnd,
 						   tcPentaxMakerNote);
 						   
 		return;
@@ -1834,17 +2038,30 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 			  
 		  #endif
 
-		  stream.SetReadPosition (fShared->fDNGPrivateDataOffset + 8);
+		  // CR-4208475 K-M1: Keep private MakerNote parsing inside the
+		  // declared DNGPrivateData payload.
+
+		  if (fShared->fDNGPrivateDataCount < 8)
+			  {
+			  return;
+			  }
+
+		  const uint64 privateDataEnd =
+			  SafeUint64Add (fShared->fDNGPrivateDataOffset,
+							 fShared->fDNGPrivateDataCount);
+
+		  stream.SetReadPosition
+			  (SafeUint64Add (fShared->fDNGPrivateDataOffset, 8));
 			  
 		  TempBigEndian temp_endian (stream, false);
 		  
 		  ParseMakerNoteIFD (host,
 							 stream,
 							 fShared->fDNGPrivateDataCount - 8,
-							 fShared->fDNGPrivateDataOffset + 8,
+							 SafeUint64Add (fShared->fDNGPrivateDataOffset, 8),
 							 fShared->fDNGPrivateDataOffset,
 							 fShared->fDNGPrivateDataOffset,
-							 fShared->fDNGPrivateDataOffset + fShared->fDNGPrivateDataCount,
+							 privateDataEnd,
 							 tcPentaxMakerNote);
 							 
 		  return;
@@ -1870,6 +2087,40 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 		
 		uint32 section_key	 = stream.Get_uint32 ();
 		uint32 section_count = stream.Get_uint32 ();
+
+		const uint32 section_data_offset = SafeUint32Add (section_offset, 8);
+
+		if (section_data_offset > fShared->fDNGPrivateDataCount ||
+			section_count > fShared->fDNGPrivateDataCount - section_data_offset)
+			{
+			ThrowBadFormat ("DNGPrivateData section extends past tag data");
+			}
+
+		const uint32 section_end_offset =
+			SafeUint32Add (section_data_offset, section_count);
+
+		const uint64 section_data_start =
+			SafeUint64Add (fShared->fDNGPrivateDataOffset,
+						   section_data_offset);
+
+		const uint64 section_end =
+			SafeUint64Add (fShared->fDNGPrivateDataOffset,
+						   section_end_offset);
+
+		const auto requireSectionRange =
+			[section_data_start,
+			 section_end] (uint64 range_offset,
+						   uint64 range_count)
+			{
+
+			if (range_offset < section_data_start ||
+				range_offset > section_end ||
+				range_count > section_end - range_offset)
+				{
+				ThrowBadFormat ("DNGPrivateData section read out of bounds");
+				}
+
+			};
 		
 		if (section_key == DNG_CHAR4 ('M','a','k','N') && section_count > 6)
 			{
@@ -1883,8 +2134,18 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				
 			#endif
 				
+			requireSectionRange (stream.Position (), 6);
+
 			uint16 order_mark = stream.Get_uint16 ();
-			int64 old_offset  = stream.Get_uint32 ();
+
+			// CR-4208475 N-L2: route the offset-delta computation through an
+			// explicit uint32 -> int64 widen so the negation is provably
+			// within int64 range, matching the L-M7 ApplyOffsetDelta
+			// discipline. The stream value is a uint32 (max 0xFFFFFFFF) so
+			// -old_offset cannot overflow.
+
+			const uint32 raw_old_offset = stream.Get_uint32 ();
+			const int64 old_offset = static_cast<int64> (raw_old_offset);
 
 			uint32 tempSize = SafeUint32Sub (section_count, 6);
 			
@@ -1904,7 +2165,7 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 							tempStream,
 							tempSize,
 							0,
-							0 - old_offset,
+							-old_offset,
 							0,
 							tempSize);
 	
@@ -1922,10 +2183,15 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				
 			#endif
 			
+			requireSectionRange (stream.Position (), 6);
+
 			uint16 order_mark = stream.Get_uint16 ();
 			uint64 old_offset = stream.Get_uint32 ();
 
-			uint64 new_offset = fShared->fDNGPrivateDataOffset + section_offset + 14;
+			uint64 new_offset =
+				SafeUint64Add (fShared->fDNGPrivateDataOffset,
+							   (uint64) section_offset,
+							   14ull);
 			
 			TempBigEndian sr2_order (stream, order_mark == byteOrderMM);
 			
@@ -1949,6 +2215,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				
 			#endif
 			
+			requireSectionRange (stream.Position (), 6);
+
 			uint16 order_mark = stream.Get_uint16 ();
 			
 			uint32 tagCount = stream.Get_uint32 ();
@@ -1959,6 +2227,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				{
 				
 				TempBigEndian raf_order (stream, order_mark == byteOrderMM);
+
+				requireSectionRange (tagOffset, tagCount);
 				
 				ParseTag (host,
 						  stream,
@@ -1976,6 +2246,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				
 				}
 			
+			requireSectionRange (stream.Position (), 4);
+
 			tagCount = stream.Get_uint32 ();
 			
 			tagOffset = stream.Position ();
@@ -1984,6 +2256,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				{
 				
 				TempBigEndian raf_order (stream, order_mark == byteOrderMM);
+
+				requireSectionRange (tagOffset, tagCount);
 				
 				ParseTag (host,
 						  stream,
@@ -2001,6 +2275,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				
 				}
 			
+			requireSectionRange (stream.Position (), 4);
+
 			tagCount = stream.Get_uint32 ();
 			
 			tagOffset = stream.Position ();
@@ -2009,6 +2285,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				{
 				
 				TempBigEndian raf_order (stream, order_mark == byteOrderMM);
+
+				requireSectionRange (tagOffset, tagCount);
 				
 				ParseTag (host,
 						  stream,
@@ -2040,6 +2318,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				
 			#endif
 			
+			requireSectionRange (stream.Position (), 6);
+
 			uint16 order_mark = stream.Get_uint16 ();
 			
 			uint32 tagCount	 = stream.Get_uint32 ();
@@ -2050,6 +2330,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				{
 				
 				TempBigEndian contax_order (stream, order_mark == byteOrderMM);
+
+				requireSectionRange (tagOffset, tagCount);
 				
 				ParseTag (host,
 						  stream,
@@ -2079,6 +2361,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 				
 			#endif
 				
+			requireSectionRange (stream.Position (), 4);
+
 			uint16 order_mark = stream.Get_uint16 ();
 			uint32 entries	  = stream.Get_uint16 ();
 			
@@ -2091,6 +2375,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 			
 				for (uint32 index = 0; index < entries; index++)
 					{
+
+					requireSectionRange (stream.Position (), 6);
 					
 					uint32 tagCode = stream.Get_uint16 ();
 											 
@@ -2105,6 +2391,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 						{
 				
 						TempBigEndian tag_order (stream, order_mark == byteOrderMM);
+
+						requireSectionRange (tagOffset, tagCount);
 					
 						ParseTag (host,
 								  stream,
@@ -2117,10 +2405,12 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 								  tagCount,
 								  tagOffset,
 								  0);
-								  
+
 						}
 					
-					stream.SetReadPosition (tagOffset + tagCount);
+					requireSectionRange (tagOffset, tagCount);
+
+					stream.SetReadPosition (SafeUint64Add (tagOffset, tagCount));
 					
 					}
 					
@@ -2189,11 +2479,20 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 					
 				#endif
 				
+				requireSectionRange (stream.Position (), 4);
+
 				uint16 order_mark = stream.Get_uint16 ();
 				uint32 entries	  = stream.Get_uint16 ();
 				
 				for (uint32 index = 0; index < entries; index++)
 					{
+
+					const uint32 entryHeaderSize =
+						SafeUint32Add (code32 ? 4u : 2u,
+									   hasType ? 2u : 0u,
+									   4u);
+
+					requireSectionRange (stream.Position (), entryHeaderSize);
 					
 					uint32 tagCode = code32 ? stream.Get_uint32 ()
 											: stream.Get_uint16 ();
@@ -2206,6 +2505,8 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 					uint32 tagSize = SafeUint32Mult (tagCount, TagTypeSize (tagType));
 					
 					uint64 tagOffset = stream.Position ();
+
+					requireSectionRange (tagOffset, tagSize);
 					
 					TempBigEndian tag_order (stream, order_mark == byteOrderMM);
 				
@@ -2229,11 +2530,15 @@ void dng_info::ParseDNGPrivateData (dng_host &host,
 			
 			}
 		
-		section_offset = SafeUint32Add (section_offset, 8);
-		section_offset = SafeUint32Add (section_offset, section_count);
+		section_offset = section_end_offset;
 		
 		if (section_offset & 1)
 			{
+			if (section_offset >= fShared->fDNGPrivateDataCount)
+				{
+				break;
+				}
+
 			section_offset = SafeUint32Add (section_offset, 1);
 			}
 		
@@ -2431,8 +2736,8 @@ void dng_info::Parse (dng_host &host,
 			
 		ParseIFD (host,
 				  stream,
-				  NULL,
-				  NULL,
+				  fExif.Get (),
+				  fShared.Get (),
 				  fChainedIFD [ChainedIFDCount () - 1],
 				  fTIFFBlockOffset + next_offset,
 				  fTIFFBlockOffset,
@@ -3037,7 +3342,15 @@ bool dng_info::IsValidDNG ()
 				
 				}
 
-			// For now, treat errors in semantic mask images as non-fatal.
+			// CR-4209035: invalid semantic mask IFDs must not be read later
+			// because their pixels can influence rendered output.
+
+			if (fIFD [index]->fNewSubFileType == sfSemanticMask)
+				{
+
+				return false;
+
+				}
 				
 			}
 		

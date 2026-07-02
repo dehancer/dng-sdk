@@ -3263,23 +3263,35 @@ big_table_tag_set::big_table_tag_set (dng_host &host,
 	if (!fDictionary.IsEmpty ())
 		{
 		
-		uint32 count = (uint32) fDictionary.Map ().size ();
+		const size_t count64 = fDictionary.Map ().size ();
+
+		if (count64 > size_t (0xFFFFFFFFu))
+			{
+			ThrowProgramError ("Too many BigTable entries");
+			}
+
+		uint32 count = (uint32) count64;
+
+		const uint32 digestBytes = SafeUint32Mult (count, 16);
 		
-		fDigestsBuffer.Reset (host.Allocate (count * 16));
+		fDigestsBuffer.Reset (host.Allocate (digestBytes));
 		
-		fBigTableDigests.SetCount (count * 16);
+		fBigTableDigests.SetCount (digestBytes);
 		fBigTableDigests.SetData  (fDigestsBuffer->Buffer_uint8 ());
 		
 		directory.Add (&fBigTableDigests);
+
+		const uint32 indexBytes = SafeUint32Mult (count,
+												  (uint32) sizeof (uint32));
 		
-		fOffsetsBuffer.Reset (host.Allocate (count * sizeof (uint32)));
+		fOffsetsBuffer.Reset (host.Allocate (indexBytes));
 		
 		fBigTableOffsets.SetCount (count);
 		fBigTableOffsets.SetData  (fOffsetsBuffer->Buffer_uint32 ());
 		
 		directory.Add (&fBigTableOffsets);
 		
-		fByteCountsBuffer.Reset (host.Allocate (count * sizeof (uint32)));
+		fByteCountsBuffer.Reset (host.Allocate (indexBytes));
 		
 		fBigTableByteCounts.SetCount (count);
 		fBigTableByteCounts.SetData	 (fByteCountsBuffer->Buffer_uint32 ());
@@ -3291,11 +3303,18 @@ big_table_tag_set::big_table_tag_set (dng_host &host,
 		if (!groupIndex.IsEmpty ())
 			{
 
-			const uint32 groups = (uint32) groupIndex.Map ().size ();
+			const size_t groupCount64 = groupIndex.Map ().size ();
+
+			if (groupCount64 > size_t (0xFFFFFFFFu))
+				{
+				ThrowProgramError ("Too many BigTable groups");
+				}
+
+			const uint32 groups = (uint32) groupCount64;
 
 			constexpr uint32 bytesPerGroup = 2 * 16;
 
-			const uint32 totalBytes = groups * bytesPerGroup;
+			const uint32 totalBytes = SafeUint32Mult (groups, bytesPerGroup);
 			
 			fGroupBuffer.Reset (host.Allocate (totalBytes));
 
@@ -3568,10 +3587,17 @@ static void EncodeDelta32 (uint32 *dPtr,
 inline void EncodeDeltaBytes (uint8 *bytePtr, int32 cols, int32 channels)
 	{
 	
+	if (cols <= 0 || channels <= 0)
+		{
+		ThrowProgramError ("Invalid EncodeDeltaBytes dimensions");
+		}
+
+	const int32 rowBytes = SafeInt32Mult (cols, channels);
+
 	if (channels == 1)
 		{
 		
-		bytePtr += (cols - 1);
+		bytePtr += (rowBytes - 1);
 		
 		uint8 this0 = bytePtr [0];
 		
@@ -3595,7 +3621,7 @@ inline void EncodeDeltaBytes (uint8 *bytePtr, int32 cols, int32 channels)
 	else if (channels == 3)
 		{
 		
-		bytePtr += (cols - 1) * 3;
+		bytePtr += (rowBytes - channels);
 		
 		uint8 this0 = bytePtr [0];
 		uint8 this1 = bytePtr [1];
@@ -3629,11 +3655,9 @@ inline void EncodeDeltaBytes (uint8 *bytePtr, int32 cols, int32 channels)
 	else
 		{
 	
-		uint32 rowBytes = cols * channels;
-		
 		bytePtr += rowBytes - 1;
 		
-		for (uint32 col = channels; col < rowBytes; col++)
+		for (int32 col = channels; col < rowBytes; col++)
 			{
 			
 			bytePtr [0] -= bytePtr [-channels];
@@ -5212,6 +5236,7 @@ dng_write_tiles_task::dng_write_tiles_task
 	,	fFakeChannels	  (fakeChannels)
 	,	fTilesDown		  (tilesDown)
 	,	fTilesAcross	  (tilesAcross)
+	,	fTileCount		  (SafeUint32Mult (tilesDown, tilesAcross))
 	,	fCompressedSize	  (compressedSize)
 	,	fUncompressedSize (uncompressedSize)
 	,	fNextTileIndex	  (0)
@@ -5268,7 +5293,7 @@ void dng_write_tiles_task::Process (uint32 /* threadIndex */,
 
 			uint32 tileIndex = fNextTileIndex++;
 
-			if (tileIndex >= fTilesDown * fTilesAcross)
+			if (tileIndex >= fTileCount)
 				{
 				return;
 				}
@@ -5514,7 +5539,9 @@ void dng_image_writer::DoWriteTiles (dng_host &host,
 									 dng_fingerprint *outDigest)
 	{
 	
-	uint32 threadCount = Min_uint32 (tilesDown * tilesAcross,
+	const uint32 tileCount = SafeUint32Mult (tilesDown, tilesAcross);
+
+	uint32 threadCount = Min_uint32 (tileCount,
 									 host.PerformAreaTaskThreads ());
 										 
 	dng_write_tiles_task task (*this,
@@ -5622,9 +5649,42 @@ void dng_image_writer::WriteImage (dng_host &host,
 	// Compute basic information.
 
 	dng_safe_uint32 bytesPerSample (TagTypeSize (image.PixelType ()));
-	
+
+	// CR-4208475 N-M4: WriteImage divides by tileRowBytes, fSubTileBlockRows,
+	// and subTileLength below. dng_safe_uint32 protects multiplication but
+	// not division, and TagTypeSize returns 0 for unknown pixel types.
+	// Programmatically built dng_ifd / dng_image objects with zero
+	// fSamplesPerPixel, fTileWidth, fTileLength, or fSubTileBlockRows would
+	// otherwise reach a divide-by-zero before any safety helper runs. Mirrors
+	// the M-M4 pattern in dng_ifd::FindStripSize.
+
+	if (bytesPerSample.Get () == 0)
+		{
+		ThrowBadFormat ("zero bytesPerSample in WriteImage");
+		}
+
+	if (ifd.fSamplesPerPixel == 0)
+		{
+		ThrowBadFormat ("zero fSamplesPerPixel in WriteImage");
+		}
+
+	if (ifd.fTileWidth == 0)
+		{
+		ThrowBadFormat ("zero fTileWidth in WriteImage");
+		}
+
+	if (ifd.fTileLength == 0)
+		{
+		ThrowBadFormat ("zero fTileLength in WriteImage");
+		}
+
+	if (ifd.fSubTileBlockRows == 0)
+		{
+		ThrowBadFormat ("zero fSubTileBlockRows in WriteImage");
+		}
+
 	dng_safe_uint32 bytesPerPixel = bytesPerSample * ifd.fSamplesPerPixel;
-	
+
 	dng_safe_uint32 tileRowBytes = bytesPerPixel * ifd.fTileWidth;
 
 	// If we can compute the number of bytes needed to store the
@@ -5658,8 +5718,9 @@ void dng_image_writer::WriteImage (dng_host &host,
 	
 	uint32 tilesAcross = ifd.TilesAcross ();
 	uint32 tilesDown   = ifd.TilesDown	 ();
+	uint32 tileCount   = SafeUint32Mult (tilesDown, tilesAcross);
 							   
-	bool useMultipleThreads = (tilesDown * tilesAcross >= 2) &&
+	bool useMultipleThreads = (tileCount >= 2) &&
 							  (host.PerformAreaTaskThreads () > 1) &&
 							  (subTileLength == ifd.fTileLength) &&
 							  (ifd.fCompression != ccUncompressed);

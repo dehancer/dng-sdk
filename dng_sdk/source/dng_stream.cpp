@@ -17,6 +17,7 @@
 #include "dng_flags.h"
 #include "dng_memory.h"
 #include "dng_rect.h"
+#include "dng_safe_arithmetic.h"
 #include "dng_tag_types.h"
 #include "dng_assertions.h"
 
@@ -36,7 +37,12 @@ dng_stream::dng_stream (dng_abort_sniffer *sniffer,
 	,	fBufferSize			  (Max_uint32 (bufferSize, gDNGStreamBlockSize * 2))
 	,	fBufferStart		  (0)
 	,	fBufferEnd			  (0)
-	,	fBufferLimit		  (bufferSize)
+		// CR-4208475 N-L3: initialize fBufferLimit from the same clamped
+		// expression as fBufferSize so the Put buffered-write fast path
+		// stays consistent with the actual allocation. The initialization
+		// list cannot reference fBufferSize directly (order-of-init varies
+		// with member order), so repeat the clamp here.
+	,	fBufferLimit		  (Max_uint32 (bufferSize, gDNGStreamBlockSize * 2))
 	,	fBufferDirty		  (false)
 	,	fSniffer			  (sniffer)
 	
@@ -212,15 +218,24 @@ dng_memory_block * dng_stream::AsMemoryBlock (dng_memory_allocator &allocator,
 	
 	uint64 len64 = Length ();
 	
-	if (len64 + uint64 (numLeadingZeroBytes) > 0xFFFFFFFF)
+	if (len64 > 0xFFFFFFFF)
 		{
 		ThrowProgramError ();
 		}
 	
 	uint32 len = (uint32) len64;
+
+	uint32 blockSize = 0;
+
+	if (!SafeUint32Add (len,
+						numLeadingZeroBytes,
+						&blockSize))
+		{
+		ThrowProgramError ();
+		}
 	
 	AutoPtr<dng_memory_block> block
-		(allocator.Allocate (len + numLeadingZeroBytes));
+		(allocator.Allocate (blockSize));
 	
 	if (len)
 		{
@@ -455,6 +470,11 @@ void dng_stream::Put (const void *data,
 	
 	// See if we can replace or append to the existing buffer.
 	
+	if (count > 0xFFFFFFFFFFFFFFFFull - fPosition)
+		{
+		ThrowProgramError ("stream write position overflow");
+		}
+
 	uint64 endPosition = fPosition + count;
 	
 	if (fBufferDirty				&&
@@ -510,8 +530,13 @@ void dng_stream::Put (const void *data,
 		
 		uint64 blockMask = ~((int64) blockRound);
 
+		// CR-4208475 K-L1: Check position arithmetic before block rounding
+		// so pathological write positions cannot wrap the buffer span.
+
+		uint64 bufferEnd = SafeUint64Add (fPosition, fBufferSize);
+
 		uint32 alignedSize = (uint32)
-							 (((fPosition + fBufferSize) & blockMask) - fPosition);
+							 ((bufferEnd & blockMask) - fPosition);
 			
 		// If write request will not fit in buffer, then write everything except
 		// for the final unaligned part of the data.
@@ -519,8 +544,10 @@ void dng_stream::Put (const void *data,
 		if (count > alignedSize)
 			{
 			
+			uint64 alignedEnd = SafeUint64Add (fPosition, count);
+
 			uint32 alignedCount = (uint32)
-								  (((fPosition + count) & blockMask) - fPosition);
+								  ((alignedEnd & blockMask) - fPosition);
 			
 			dng_abort_sniffer::SniffForAbort (fSniffer);
 			
@@ -958,26 +985,39 @@ void dng_stream::Put_real64 (real64 x)
 
 /*****************************************************************************/
 	
-void dng_stream::Get_CString (char *data, uint32 maxLength)
+void dng_stream::Get_CString (char *data,
+							  uint32 maxLength,
+							  uint32 maxStreamBytes)
 	{
 
 	memset (data, 0, maxLength);
-	
+
 	uint32 index = 0;
-	
+	uint32 streamBytes = 0;
+
 	while (true)
 		{
-		
+
+		// CR-4208475 N-L4: bound stream consumption so a malformed non-
+		// terminated string in a tag-local payload cannot keep reading
+		// into adjacent file bytes.
+
+		if (streamBytes >= maxStreamBytes)
+			{
+			ThrowBadFormat ();
+			}
+
 		char c = (char) Get_uint8 ();
-		
+		streamBytes++;
+
 		if (index + 1 < maxLength)
 			data [index++] = c;
-		
+
 		if (c == 0)
 			break;
-			
+
 		}
-	
+
 	}
 
 /*****************************************************************************/
@@ -998,26 +1038,42 @@ void dng_stream::Put_CString (const char *data)
 
 /*****************************************************************************/
 	
-void dng_stream::Get_UString (char *data, uint32 maxLength)
+void dng_stream::Get_UString (char *data,
+							  uint32 maxLength,
+							  uint32 maxStreamBytes)
 	{
-	
+
 	memset (data, 0, maxLength);
-	
+
 	uint32 index = 0;
-	
+	uint32 streamBytes = 0;
+
 	while (true)
 		{
-		
+
+		// CR-4208475 N-L4: bound stream consumption (in bytes, not 16-bit
+		// code units) so a malformed non-terminated string cannot keep
+		// reading into adjacent file bytes. Test the remaining budget without
+		// subtracting from maxStreamBytes first, so tiny explicit budgets
+		// fail closed instead of underflowing the limit check.
+
+		if (streamBytes > maxStreamBytes ||
+			maxStreamBytes - streamBytes < 2)
+			{
+			ThrowBadFormat ();
+			}
+
 		char c = (char) Get_uint16 ();
-		
+		streamBytes += 2;
+
 		if (index + 1 < maxLength)
 			data [index++] = (char) c;
-		
+
 		if (c == 0)
 			break;
-			
+
 		}
-	
+
 	}
 		
 /*****************************************************************************/
@@ -1537,7 +1593,7 @@ dng_stream_contiguous_read_hint::dng_stream_contiguous_read_hint
 	
 	// Don't bother changing buffer size if only a small change.
 	
-	if (count > fOldBufferSize * 4)
+	if (count > uint64 (fOldBufferSize) * 4)
 		{
 		
 		// Round contiguous size up and down to stream blocks.
@@ -1546,7 +1602,9 @@ dng_stream_contiguous_read_hint::dng_stream_contiguous_read_hint
 		
 		uint64 blockMask  = ~((int64) blockRound);
 		
-		count = (count + (offset & blockRound) + blockRound) & blockMask;
+		count = SafeUint64Add (count,
+							   offset & blockRound,
+							   blockRound) & blockMask;
 		
 		// Limit to maximum buffer size.
 		
@@ -1555,13 +1613,16 @@ dng_stream_contiguous_read_hint::dng_stream_contiguous_read_hint
 		// To avoid reading too many bytes with the final read, adjust buffer
 		// size the to make an exact number of buffers fit.
 		
-		uint64 numBuffers = (count + newBufferSize - 1) / newBufferSize;
+		uint64 numBuffers = SafeUint64Add (count,
+										   newBufferSize - 1) / newBufferSize;
 		
-		newBufferSize = (count + numBuffers - 1) / numBuffers;
+		newBufferSize = SafeUint64Add (count,
+									   numBuffers - 1) / numBuffers;
 		
 		// Finally round up to a block size.
 		
-		newBufferSize = (newBufferSize + blockRound) & blockMask;
+		newBufferSize = SafeUint64Add (newBufferSize,
+									   blockRound) & blockMask;
 		
 		// Change the buffer size.
 		

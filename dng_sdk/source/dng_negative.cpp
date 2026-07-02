@@ -49,6 +49,12 @@
 
 /*****************************************************************************/
 
+static const uint32 kMaxEmbeddedMakerNoteBlockSize	= 128u * 1024u * 1024u;
+static const uint32 kMaxEmbeddedIPTCBlockSize		= 128u * 1024u * 1024u;
+static const uint32 kMaxEmbeddedXMPBlockSize		= 128u * 1024u * 1024u;
+
+/*****************************************************************************/
+
 void dng_semantic_mask::CalcMaskSubArea (dng_point &origin,
 										 dng_rect &wholeImageArea) const
 	{
@@ -1935,16 +1941,26 @@ class dng_find_new_raw_image_digest_task : public dng_area_task
 			,	fTilesDown	 (0)
 			,	fTileCount	 (0)
 			,	fTileHash    ()
-			
+
 			{
-			
+
 			fMinTaskArea = 1;
-									
+
+			// CR-4208475 N-M5: reject empty image bounds before fUnitCell
+			// collapses to (0, 0) and Start / Process divide by it. The
+			// digest API has no meaningful answer for an empty image, so
+			// fail-closed mirrors the D-1-8 dng_tile_iterator pattern.
+
+			if (fImage.Bounds ().IsEmpty ())
+				{
+				ThrowProgramError ("Empty image bounds in tile digest task");
+				}
+
 			fUnitCell = dng_point (Min_int32 (kTileSize, fImage.Bounds ().H ()),
 								   Min_int32 (kTileSize, fImage.Bounds ().W ()));
-								   
+
 			fMaxTileSize = fUnitCell;
-						
+
 			}
 	
 		virtual void Start (uint32 threadCount,
@@ -3989,10 +4005,35 @@ void dng_negative::PostParse (dng_host &host,
 			if (IsMakerNoteSafe () && info.fTIFFBlockOriginalOffset != kDNGStreamInvalidOffset)
 				{
 
+				if (shared.fMakerNoteCount > kMaxEmbeddedMakerNoteBlockSize)
+					{
+					ThrowBadFormat ("MakerNote block too large");
+					}
+
 				AutoPtr<dng_memory_block> block (host.Allocate (shared.fMakerNoteCount));
-				
-				stream.SetReadPosition (shared.fMakerNoteOffset + info.fTIFFBlockOriginalOffset -
-																  info.fTIFFBlockOffset);
+
+				// CR-4208475 M-L6: Compute the MakerNote read position
+				// with explicit underflow / overflow checks instead of
+				// the open-coded `a + b - c` uint64 expression. The
+				// subtraction (fTIFFBlockOriginalOffset - fTIFFBlockOffset)
+				// can wrap when the original offset was below the current
+				// block offset, and the subsequent add can wrap on huge
+				// fMakerNoteOffset values. dng_stream::SetReadPosition
+				// already rejects an out-of-range position, but failing
+				// here gives a clearer diagnostic.
+
+				if (info.fTIFFBlockOriginalOffset < info.fTIFFBlockOffset)
+					{
+					ThrowBadFormat ("Inverted TIFF block offsets while "
+									"resolving MakerNote position");
+					}
+
+				uint64 makerNotePos =
+					SafeUint64Add (shared.fMakerNoteOffset,
+								   info.fTIFFBlockOriginalOffset -
+								   info.fTIFFBlockOffset);
+
+				stream.SetReadPosition (makerNotePos);
 					
 				stream.Get (block->Buffer (), shared.fMakerNoteCount);
 									
@@ -4006,6 +4047,11 @@ void dng_negative::PostParse (dng_host &host,
 		
 		if (shared.fIPTC_NAA_Count)
 			{
+
+			if (shared.fIPTC_NAA_Count > kMaxEmbeddedIPTCBlockSize)
+				{
+				ThrowBadFormat ("IPTC block too large");
+				}
 			
 			AutoPtr<dng_memory_block> block (host.Allocate (shared.fIPTC_NAA_Count));
 			
@@ -4026,6 +4072,11 @@ void dng_negative::PostParse (dng_host &host,
 		
 		if (shared.fXMPCount)
 			{
+
+			if (shared.fXMPCount > kMaxEmbeddedXMPBlockSize)
+				{
+				ThrowBadFormat ("XMP block too large");
+				}
 			
 			AutoPtr<dng_memory_block> block (host.Allocate (shared.fXMPCount));
 			

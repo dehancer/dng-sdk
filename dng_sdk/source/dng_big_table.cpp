@@ -941,6 +941,21 @@ const dng_fingerprint & dng_big_table::Fingerprint () const
 
 /*****************************************************************************/
 
+uint32 dng_big_table::MaxCompressedDecodedStreamSize () const
+	{
+
+	static const uint32 kMaxCompressedBigTableDecodedSize = 128u * 1024u * 1024u;
+
+	// Image table classes bypass the outer zlib big-table wrapper and enforce
+	// their own image-specific limits. This cap applies only to the generic
+	// compressed metadata-table stream.
+
+	return kMaxCompressedBigTableDecodedSize;
+
+	}
+
+/*****************************************************************************/
+
 dng_fingerprint dng_big_table::ComputeFingerprint () const
 	{
 	
@@ -1002,6 +1017,8 @@ bool dng_big_table::DecodeFromBinary (dng_host &host,
 
 		uint8 *uncompressedData;
 		uint32 uncompressedSize;
+
+		const uint32 maxUncompressedSize = MaxCompressedDecodedStreamSize ();
 		
 		AutoPtr<dng_memory_block> uncompressedBlock;
 		
@@ -1009,6 +1026,12 @@ bool dng_big_table::DecodeFromBinary (dng_host &host,
 			{
 			uncompressedData = uncompressedCache->Get ()->Buffer_uint8 ();
 			uncompressedSize = uncompressedCache->Get ()->LogicalSize  ();
+
+			if (uncompressedSize > maxUncompressedSize)
+				{
+				return false;
+				}
+
 			}
 			
 		else
@@ -1022,6 +1045,11 @@ bool dng_big_table::DecodeFromBinary (dng_host &host,
 							   (((uint32) compressedData [2]) << 16) +
 							   (((uint32) compressedData [3]) << 24);
 
+			if (uncompressedSize > maxUncompressedSize)
+				{
+				return false;
+				}
+
 			uncompressedBlock.Reset (host.Allocate (uncompressedSize));
 			
 			uncompressedData = uncompressedBlock->Buffer_uint8 ();
@@ -1034,6 +1062,11 @@ bool dng_big_table::DecodeFromBinary (dng_host &host,
 										compressedSize - 4);
 
 			if (zResult != Z_OK)
+				{
+				return false;
+				}
+
+			if (destLen != (uLongf) uncompressedSize)
 				{
 				return false;
 				}
@@ -1211,7 +1244,8 @@ void dng_big_table::ASCIItoBinary (dng_memory_allocator &allocator,
 		
 	dCount = 0;
 	
-	uint32 maxDecodedSize = (sCount + 4) / 5 * 4;
+	uint32 maxDecodedSize = SafeUint32Mult (SafeUint32Add (sCount, 4) / 5,
+											4);
 
 	dBlock.Reset (allocator.Allocate (maxDecodedSize));
 
@@ -1375,9 +1409,17 @@ dng_memory_block* dng_big_table::EncodeAsBinary (dng_memory_allocator &allocator
 
 		uint32 uncompressedSize = block1->LogicalSize ();
 
-		uint32 safeCompressedSize = uncompressedSize + (uncompressedSize >> 8) + 64;
+		// CR-4208475 N-L13: route the zlib destination sizing through
+		// SafeUint32Add so pathological in-memory big-table sizes cannot
+		// wrap and under-allocate the compress2 destination buffer.
 
-		block2.Reset (allocator.Allocate (safeCompressedSize + 4));
+		uint32 safeCompressedSize =
+			SafeUint32Add (SafeUint32Add (uncompressedSize,
+										  uncompressedSize >> 8),
+						   64u);
+
+		block2.Reset (allocator.Allocate (SafeUint32Add (safeCompressedSize,
+														 4u)));
 
 		// Store uncompressed size in first four bytes of compressed block.
 
@@ -1401,7 +1443,16 @@ dng_memory_block* dng_big_table::EncodeAsBinary (dng_memory_allocator &allocator
 			ThrowMemoryFull ();
 			}
 
-		compressedSize = (uint32) dCount + 4;
+		// CR-4208475 N-L13: dCount is uLongf (>= 32 bits). Require it fits
+		// in uint32 before narrowing, and route the + 4 through
+		// SafeUint32Add so the header-byte addition cannot wrap.
+
+		if (dCount > 0xFFFFFFFFu)
+			{
+			ThrowProgramError ("compress2 output too large for uint32");
+			}
+
+		compressedSize = SafeUint32Add (static_cast<uint32> (dCount), 4u);
 
 		block1.Reset ();
 
@@ -1443,10 +1494,16 @@ dng_memory_block* dng_big_table::EncodeAsString (dng_memory_allocator &allocator
 			"*?`'|()[]{"
 			"}@%$#";
 
-		uint32 safeEncodedSize = compressedSize +
-								 (compressedSize >> 2) +
-								 (compressedSize >> 6) +
-								 16;
+		// CR-4208475 N-L12: writer-side counterpart to the G-L1 ASCIItoBinary
+		// fix. Route the encoded-size accumulation through SafeUint32Add so
+		// a pathological compressedSize cannot wrap and under-allocate the
+		// destination buffer before the encode loop writes into it.
+
+		uint32 safeEncodedSize =
+			SafeUint32Add (SafeUint32Add (compressedSize,
+										  compressedSize >> 2),
+						   SafeUint32Add (compressedSize >> 6,
+										  16u));
 
 		block3.Reset (allocator.Allocate (safeEncodedSize));
 
@@ -3563,6 +3620,12 @@ bool dng_packed_image_table::GetStream (dng_stream &stream)
 
 	const uint32 bytes = stream.Get_uint32 ();
 
+	if (stream.Position () > stream.Length () ||
+		bytes > stream.Length () - stream.Position ())
+		{
+		ThrowBadFormat ("Invalid packed image table byte count");
+		}
+
 	AutoPtr<dng_host> host (MakeHost (stream.Sniffer ()));
 
 	AutoPtr<dng_memory_block> block (host->Allocate (bytes));
@@ -3957,13 +4020,33 @@ void dng_masked_rgb_table::CheckGamutExtension (dng_rgb_table::gamut_enum gamut)
 
 /*****************************************************************************/
 
+static void RequireRGBTablesBytes (dng_stream &stream,
+								   uint64 tagEnd,
+								   uint32 byteCount)
+	{
+
+	if (stream.Position () > tagEnd ||
+		byteCount > tagEnd - stream.Position ())
+		{
+		ThrowBadFormat ("Truncated RGBTables tag");
+		}
+
+	}
+
+/*****************************************************************************/
+
 void dng_masked_rgb_table::GetStream (dng_host &host,
-									  dng_stream &stream)
+									  dng_stream &stream,
+									  uint64 tagEnd)
 	{
 	
 	// Read LengthTableSemanticName and TableSemanticName.
 
+	RequireRGBTablesBytes (stream, tagEnd, 2);
+
 	uint16 nameLen = stream.Get_uint16 ();
+
+	RequireRGBTablesBytes (stream, tagEnd, nameLen);
 
 	dng_memory_data nameData (nameLen + 1);
 
@@ -3974,6 +4057,8 @@ void dng_masked_rgb_table::GetStream (dng_host &host,
 	fTableSemanticName.Set (nameData.Buffer_char ());
 
 	// Read Divisions.
+
+	RequireRGBTablesBytes (stream, tagEnd, 5);
 
 	uint32 divisions = (uint32) stream.Get_uint8 ();
 
@@ -4021,6 +4106,8 @@ void dng_masked_rgb_table::GetStream (dng_host &host,
 	uint32 dstBytes = divisions * divisions * divisions * 4 * 2;
 
 	dng_ref_counted_block samples;
+
+	RequireRGBTablesBytes (stream, tagEnd, srcBytes);
 
 	samples.Allocate (dstBytes);
 
@@ -4875,10 +4962,21 @@ void dng_masked_rgb_tables::PutStream (dng_stream &stream) const
 
 dng_masked_rgb_tables * dng_masked_rgb_tables::GetStream (dng_host &host,
 														  dng_stream &stream,
-														  const bool isDraft)
+														  const bool isDraft,
+														  uint32 tagCount)
 	{
 
+	const uint64 tagEnd = SafeUint64Add (stream.Position (),
+										 (uint64) tagCount);
+
+	if (tagEnd > stream.Length ())
+		{
+		ThrowBadFormat ("Invalid RGBTables tag count");
+		}
+
 	// Read number of tables.
+
+	RequireRGBTablesBytes (stream, tagEnd, 4);
 
 	uint32 numTables = stream.Get_uint32 ();
 
@@ -4904,7 +5002,9 @@ dng_masked_rgb_tables * dng_masked_rgb_tables::GetStream (dng_host &host,
 
 	if (!isDraft)
 		{
-		
+
+		RequireRGBTablesBytes (stream, tagEnd, 4);
+
 		method = (composite_method) stream.Get_uint32 ();
 
 		if (method != kWeightedSum &&
@@ -4926,7 +5026,7 @@ dng_masked_rgb_tables * dng_masked_rgb_tables::GetStream (dng_host &host,
 		
 		t.reset (new dng_masked_rgb_table);
 
-		t->GetStream (host, stream);
+		t->GetStream (host, stream, tagEnd);
 		
 		}
 
@@ -5537,7 +5637,9 @@ void DualParseXMP (dng_host &host,
 		
 	// Null pad XMP text so we can use string searching functions.
 	
-	AutoPtr<dng_memory_block> tempBlock (host.Allocate (blockSize + 1));
+	const uint32 paddedBlockSize = SafeUint32Add (blockSize, 1u);
+
+	AutoPtr<dng_memory_block> tempBlock (host.Allocate (paddedBlockSize));
 	
 	memcpy (tempBlock->Buffer (),
 			blockData,
