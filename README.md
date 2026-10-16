@@ -12,6 +12,14 @@ Watch out for DNG SDK releases here: https://helpx.adobe.com/camera-raw/desktop/
 
 `xmp/toolkit/third-party/zuid/interfaces/MD5.cpp` is only present in this repository.
 
+# Update from upstream instructions
+
+1. Extract Adobe DNG SDK (e.g. `dng_sdk_1_7_1_2768_20261013.zip`)
+2. Copy all files and folders from extracted dig (e.g. `dng_sdk_1_7_1`) into this repository
+3. `git checkout xmp/toolkit/third-party/zuid/interfaces/MD5.cpp`
+
+Review changes and commit with message "Bump to 1.7.1 Build 2768, October 13, 2026" (copy exact line from the Adobe page).
+
 # Build instructions for macOS
 
 ## Deps
