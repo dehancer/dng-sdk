@@ -61,6 +61,40 @@ additional dependencies:
 
 Release Notes / Changelog:
 
+1.7.1 2768 October 13, 2026
+
+    - Exif Lens Vignette Info support.
+
+    - XMP_NS_CRCO namespace.
+
+    - Big table enhancements for oversized XMP.
+
+    - Preserve date-only metadata.
+
+    - Preserve Canon M-RAW predictor narrowing.
+
+    - Vulnerability issue fixes.
+
+1.7.1 2724 September 8, 2026
+
+    - RGB Table fixes.
+
+    - Fix for crash on exit.
+
+    - Big table namespace work.
+
+    - EncodeDelta fixes.
+
+    - AVIF/HEIC/HEIF c2pa fallback logic.
+
+    - Vulnerability issue fixes.
+
+1.7.1 2652 July 14, 2026
+
+    - Padded XMP packet fixes.
+
+    - Vulnerability issue fixes.
+
 1.7.1 2611 June 9, 2026
 
     - TIFF and ARW read fixes.

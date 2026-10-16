@@ -34,6 +34,7 @@
 #include "dng_mosaic_info.h"
 #include "dng_preview.h"
 #include "dng_read_image.h"
+#include "dng_ref_counted_block.h"
 #include "dng_resample.h"
 #include "dng_safe_arithmetic.h"
 #include "dng_sdk_limits.h"
@@ -52,6 +53,577 @@
 static const uint32 kMaxEmbeddedMakerNoteBlockSize	= 128u * 1024u * 1024u;
 static const uint32 kMaxEmbeddedIPTCBlockSize		= 128u * 1024u * 1024u;
 static const uint32 kMaxEmbeddedXMPBlockSize		= 128u * 1024u * 1024u;
+static const uint32 kTrimmedEmbeddedXMPPaddingSize	= 4096u;
+
+// CR-4209376: Bound the decoded, deduplicated table data independently from
+// the ordinary XMP packet content.
+
+static const uint32 kMaxEmbeddedXMPBigTableDataSize	= 512u * 1024u * 1024u;
+
+/*****************************************************************************/
+
+static bool IsXMPPacketWhitespace (uint8 ch)
+	{
+
+	return ch == ' '  ||
+		   ch == '\t' ||
+		   ch == '\n' ||
+		   ch == '\r';
+
+	}
+
+/*****************************************************************************/
+
+static bool FindPatternInStream (dng_stream &stream,
+								 uint64 offset,
+								 uint64 count,
+								 const char *pattern,
+								 uint32 patternSize,
+								 uint64 &patternOffset)
+	{
+
+	DNG_REQUIRE (patternSize > 0, "Expected pattern");
+
+	const uint32 kBufferSize = 64u * 1024u;
+
+	dng_memory_data buffer (kBufferSize + patternSize);
+
+	uint8 *data = buffer.Buffer_uint8 ();
+
+	uint32 carryCount = 0;
+
+	uint64 position = offset;
+	uint64 remaining = count;
+
+	while (remaining)
+		{
+
+		dng_abort_sniffer::SniffForAbort (stream.Sniffer ());
+
+		uint32 readCount = (uint32) Min_uint64 (remaining, kBufferSize);
+
+		stream.SetReadPosition (position);
+
+		stream.Get (data + carryCount, readCount);
+
+		uint32 searchCount = carryCount + readCount;
+
+		for (uint32 j = 0; j + patternSize <= searchCount; j++)
+			{
+
+			if (!memcmp (data + j, pattern, patternSize))
+				{
+
+				patternOffset = position - carryCount + j;
+
+				return true;
+
+				}
+
+			}
+
+		carryCount = Min_uint32 (patternSize - 1, searchCount);
+
+		if (carryCount)
+			{
+			memmove (data, data + searchCount - carryCount, carryCount);
+			}
+
+		position += readCount;
+		remaining -= readCount;
+
+		}
+
+	return false;
+
+	}
+
+/*****************************************************************************/
+
+static bool StreamRangeIsXMPPacketWhitespace (dng_stream &stream,
+											  uint64 offset,
+											  uint64 count)
+	{
+
+	const uint32 kBufferSize = 64u * 1024u;
+
+	dng_memory_data buffer (kBufferSize);
+
+	uint64 position = offset;
+	uint64 remaining = count;
+
+	while (remaining)
+		{
+
+		dng_abort_sniffer::SniffForAbort (stream.Sniffer ());
+
+		uint32 readCount = (uint32) Min_uint64 (remaining, kBufferSize);
+
+		stream.SetReadPosition (position);
+
+		stream.Get (buffer.Buffer (), readCount);
+
+		const uint8 *data = buffer.Buffer_uint8 ();
+
+		for (uint32 j = 0; j < readCount; j++)
+			{
+
+			if (!IsXMPPacketWhitespace (data [j]))
+				{
+				return false;
+				}
+
+			}
+
+		position += readCount;
+		remaining -= readCount;
+
+		}
+
+	return true;
+
+	}
+
+/*****************************************************************************/
+
+static bool StreamRangeMatches (dng_stream &stream,
+								uint64 offset,
+								const char *pattern,
+								uint32 patternSize)
+	{
+
+	dng_memory_data buffer (patternSize);
+
+	stream.SetReadPosition (offset);
+	stream.Get (buffer.Buffer (), patternSize);
+
+	return memcmp (buffer.Buffer (), pattern, patternSize) == 0;
+
+	}
+
+/*****************************************************************************/
+
+struct embedded_xmp_table_entry
+	{
+
+	dng_fingerprint fFingerprint;
+
+	uint64 fDataOffset = 0;
+	uint64 fDataBytes = 0;
+
+	uint64 fWrapperOffset = 0;
+	uint64 fWrapperBytes = 0;
+
+	};
+
+/*****************************************************************************/
+
+static bool FindEmbeddedXMPTable (dng_stream &stream,
+								  uint64 packetOffset,
+								  uint64 packetEnd,
+								  uint64 &searchOffset,
+								  embedded_xmp_table_entry &entry)
+	{
+
+	const char kTablePrefix [] = "Table_";
+	const char *kNamespaces [] = { "crs:", "crss:", "crvc:" };
+
+	while (searchOffset < packetEnd)
+		{
+
+		uint64 tableOffset = 0;
+
+		if (!FindPatternInStream (stream,
+							  searchOffset,
+							  packetEnd - searchOffset,
+							  kTablePrefix,
+							  (uint32) strlen (kTablePrefix),
+							  tableOffset))
+			{
+			searchOffset = packetEnd;
+			return false;
+			}
+
+		searchOffset = tableOffset + strlen (kTablePrefix);
+
+		if (packetEnd - tableOffset < strlen (kTablePrefix) + 32)
+			continue;
+
+		char fingerprintString [33];
+
+		stream.SetReadPosition (tableOffset + strlen (kTablePrefix));
+		stream.Get (fingerprintString, 32);
+		fingerprintString [32] = 0;
+
+		if (!entry.fFingerprint.FromUtf8HexString (fingerprintString) ||
+			!entry.fFingerprint.IsValid ())
+			continue;
+
+		const uint64 tableNameEnd = tableOffset + strlen (kTablePrefix) + 32;
+
+		for (const char *namespacePrefix : kNamespaces)
+			{
+
+			const uint32 namespaceSize = (uint32) strlen (namespacePrefix);
+
+			// Compact form: crs:Table_<fingerprint>="data"
+
+			if (tableOffset >= packetOffset + namespaceSize + 1 &&
+				packetEnd - tableNameEnd >= 2 &&
+				StreamRangeMatches (stream,
+								tableOffset - namespaceSize,
+								namespacePrefix,
+								namespaceSize) &&
+				StreamRangeIsXMPPacketWhitespace (stream,
+											  tableOffset - namespaceSize - 1,
+											  1) &&
+				StreamRangeMatches (stream, tableNameEnd, "=\"", 2))
+				{
+
+				const uint64 dataOffset = tableNameEnd + 2;
+				uint64 dataEnd = 0;
+
+				if (!FindPatternInStream (stream,
+									  dataOffset,
+									  packetEnd - dataOffset,
+									  "\"",
+									  1,
+									  dataEnd))
+					continue;
+
+				entry.fDataOffset = dataOffset;
+				entry.fDataBytes = dataEnd - dataOffset;
+				entry.fWrapperOffset = tableOffset - namespaceSize;
+				entry.fWrapperBytes = dataEnd + 1 - entry.fWrapperOffset;
+
+				searchOffset = dataEnd + 1;
+
+				return true;
+
+				}
+
+			// Non-compact form:
+			// <crs:Table_<fingerprint>>data</crs:Table_<fingerprint>>
+
+			if (tableOffset >= packetOffset + namespaceSize + 1 &&
+				packetEnd - tableNameEnd >= 1 &&
+				StreamRangeMatches (stream,
+								tableOffset - namespaceSize - 1,
+								"<",
+								1) &&
+				StreamRangeMatches (stream,
+								tableOffset - namespaceSize,
+								namespacePrefix,
+								namespaceSize) &&
+				StreamRangeMatches (stream, tableNameEnd, ">", 1))
+				{
+
+				const uint64 dataOffset = tableNameEnd + 1;
+
+				dng_string endPattern ("</");
+				endPattern.Append (namespacePrefix);
+				endPattern.Append (kTablePrefix);
+				endPattern.Append (fingerprintString);
+				endPattern.Append (">");
+
+				uint64 dataEnd = 0;
+
+				if (!FindPatternInStream (stream,
+									  dataOffset,
+									  packetEnd - dataOffset,
+									  endPattern.Get (),
+									  endPattern.Length (),
+									  dataEnd))
+					continue;
+
+				entry.fDataOffset = dataOffset;
+				entry.fDataBytes = dataEnd - dataOffset;
+				entry.fWrapperOffset = tableOffset - namespaceSize - 1;
+				entry.fWrapperBytes = dataEnd + endPattern.Length () -
+									  entry.fWrapperOffset;
+
+				searchOffset = dataEnd + endPattern.Length ();
+
+				return true;
+
+				}
+
+			}
+
+		}
+
+	return false;
+
+	}
+
+/*****************************************************************************/
+
+static void CopyEmbeddedXMPRange (dng_stream &src,
+								  uint64 offset,
+								  uint64 count,
+								  dng_memory_stream &dst)
+	{
+
+	if (dst.Length () > kMaxEmbeddedXMPBlockSize ||
+		count > kMaxEmbeddedXMPBlockSize - dst.Length ())
+		ThrowBadFormat ("XMP block too large");
+
+	src.SetReadPosition (offset);
+	src.CopyToStream (dst, count);
+
+	}
+
+/*****************************************************************************/
+
+// Returns a caller-owned compact XMP block when at least one recognized table
+// is extracted, or a non-owning null pointer when no table is found.
+
+static dng_memory_block * CompactEmbeddedXMPBigTables
+	(dng_host &host,
+	 dng_stream &stream,
+	 uint64 offset,
+	 uint32 count,
+	 dng_big_table_dictionary &dictionary)
+	{
+
+	const uint64 packetEnd = SafeUint64Add (offset, count);
+
+	dng_memory_stream compactXMP (host.Allocator ());
+
+	uint64 sourceOffset = offset;
+	uint64 searchOffset = offset;
+	uint32 addedTableBytes = 0;
+	bool foundTable = false;
+
+	embedded_xmp_table_entry entry;
+
+	while (FindEmbeddedXMPTable (stream,
+								  offset,
+								  packetEnd,
+								  searchOffset,
+								  entry))
+		{
+
+		foundTable = true;
+
+		CopyEmbeddedXMPRange (stream,
+							  sourceOffset,
+							  entry.fWrapperOffset - sourceOffset,
+							  compactXMP);
+
+		if (!dictionary.HasTable (entry.fFingerprint))
+			{
+
+			if (entry.fDataBytes > 0xFFFFFFFFu)
+				ThrowBadFormat ("Embedded XMP big table too large");
+
+			dng_ref_counted_block tableBlock;
+
+			dng_big_table::ASCIItoBinary
+				(stream,
+				 entry.fDataOffset,
+				 (uint32) entry.fDataBytes,
+				 kMaxEmbeddedXMPBigTableDataSize - addedTableBytes,
+				 tableBlock);
+
+			addedTableBytes = SafeUint32Add (addedTableBytes,
+										 tableBlock.LogicalSize ());
+
+			if (tableBlock.LogicalSize ())
+				dictionary.AddTable (entry.fFingerprint, tableBlock);
+
+			}
+
+		sourceOffset = entry.fWrapperOffset + entry.fWrapperBytes;
+
+		}
+
+	if (!foundTable)
+		return nullptr;
+
+	CopyEmbeddedXMPRange (stream,
+							  sourceOffset,
+							  packetEnd - sourceOffset,
+							  compactXMP);
+
+	return compactXMP.AsMemoryBlock (host.Allocator ());
+
+	}
+
+/*****************************************************************************/
+
+static dng_fingerprint StreamRangeFingerprint (dng_stream &stream,
+											   uint64 offset,
+											   uint32 count)
+	{
+
+	const uint32 kBufferSize = 64u * 1024u;
+
+	dng_memory_data buffer (kBufferSize);
+	dng_md5_direct_printer printer;
+
+	uint64 position = offset;
+	uint32 remaining = count;
+
+	while (remaining)
+		{
+
+		dng_abort_sniffer::SniffForAbort (stream.Sniffer ());
+
+		const uint32 readCount = Min_uint32 (remaining, kBufferSize);
+
+		stream.SetReadPosition (position);
+		stream.Get (buffer.Buffer (), readCount);
+
+		printer.ProcessPtr (buffer.Buffer (), readCount);
+
+		position += readCount;
+		remaining -= readCount;
+
+		}
+
+	return printer.Result ();
+
+	}
+
+/*****************************************************************************/
+
+// CR-4209376: Some legacy DNG files contain small valid XMP packets with
+// pathological amounts of packet padding.  Keep the embedded metadata block
+// allocation cap, but allow these files after verifying that the oversized
+// portion is only XML packet whitespace and trimming it to a normal reserve.
+// Returns a caller-owned block containing the bounded XMP representation.
+
+static dng_memory_block * ReadEmbeddedXMPBlock (dng_host &host,
+												dng_stream &stream,
+												uint64 offset,
+												uint32 count,
+												dng_big_table_dictionary &dictionary,
+												dng_fingerprint &sourceDigest)
+	{
+
+	if (count <= kMaxEmbeddedXMPBlockSize)
+		{
+
+		AutoPtr<dng_memory_block> block (host.Allocate (count));
+
+		stream.SetReadPosition (offset);
+
+		stream.Get (block->Buffer (),
+					block->LogicalSize ());
+
+		return block.Release ();
+
+		}
+
+	// CR-4209376: Large panorama edits can contain hundreds of megabytes of
+	// encoded filter image tables. Extract recognized table properties directly
+	// from the file stream, deduplicate them by fingerprint, and retain the
+	// ordinary XMP under the original allocation cap.
+
+	sourceDigest = StreamRangeFingerprint (stream, offset, count);
+
+	if (dng_memory_block *block = CompactEmbeddedXMPBigTables (host,
+															   stream,
+															   offset,
+															   count,
+															   dictionary))
+		return block;
+
+	const char kXMPMetaEnd [] = "</x:xmpmeta>";
+	const char kXMPPacketEndStart [] = "<?xpacket end=";
+	const char kXMPPacketEndClose [] = "?>";
+
+	uint64 xmpMetaEndOffset = 0;
+
+	if (!FindPatternInStream (stream,
+							  offset,
+							  kMaxEmbeddedXMPBlockSize,
+							  kXMPMetaEnd,
+							  (uint32) strlen (kXMPMetaEnd),
+							  xmpMetaEndOffset))
+		{
+		ThrowBadFormat ("XMP block too large");
+		}
+
+	uint64 contentEndOffset = xmpMetaEndOffset + strlen (kXMPMetaEnd);
+
+	uint64 packetEndStartOffset = 0;
+
+	if (!FindPatternInStream (stream,
+							  contentEndOffset,
+							  offset + count - contentEndOffset,
+							  kXMPPacketEndStart,
+							  (uint32) strlen (kXMPPacketEndStart),
+							  packetEndStartOffset))
+		{
+		ThrowBadFormat ("XMP block too large");
+		}
+
+	if (!StreamRangeIsXMPPacketWhitespace (stream,
+										   contentEndOffset,
+										   packetEndStartOffset - contentEndOffset))
+		{
+		ThrowBadFormat ("XMP block too large");
+		}
+
+	uint64 packetEndCloseOffset = 0;
+
+	if (!FindPatternInStream (stream,
+							  packetEndStartOffset,
+							  offset + count - packetEndStartOffset,
+							  kXMPPacketEndClose,
+							  (uint32) strlen (kXMPPacketEndClose),
+							  packetEndCloseOffset))
+		{
+		ThrowBadFormat ("XMP block too large");
+		}
+
+	uint64 packetEndOffset = packetEndCloseOffset + strlen (kXMPPacketEndClose);
+
+	if (!StreamRangeIsXMPPacketWhitespace (stream,
+										   packetEndOffset,
+										   offset + count - packetEndOffset))
+		{
+		ThrowBadFormat ("XMP block too large");
+		}
+
+	uint32 contentSize = (uint32) (contentEndOffset - offset);
+	uint32 trailerSize = (uint32) (packetEndOffset - packetEndStartOffset);
+
+	// CR-4208475 Q-H1: Validate the complete retained size before narrowing so
+	// a near-4 GiB packet trailer cannot wrap the allocation below the cap.
+
+	const uint64 trimmedSize64 =
+		SafeUint64Add (contentSize,
+					   kTrimmedEmbeddedXMPPaddingSize,
+					   trailerSize);
+
+	if (trimmedSize64 > kMaxEmbeddedXMPBlockSize)
+		{
+		ThrowBadFormat ("XMP block too large");
+		}
+
+	const uint32 trimmedSize = (uint32) trimmedSize64;
+
+	AutoPtr<dng_memory_block> block (host.Allocate (trimmedSize));
+
+	uint8 *dst = block->Buffer_uint8 ();
+
+	stream.SetReadPosition (offset);
+
+	stream.Get (dst, contentSize);
+
+	memset (dst + contentSize, ' ', kTrimmedEmbeddedXMPPaddingSize);
+
+	stream.SetReadPosition (packetEndStartOffset);
+
+	stream.Get (dst + contentSize + kTrimmedEmbeddedXMPPaddingSize,
+				trailerSize);
+
+	return block.Release ();
+
+	}
 
 /*****************************************************************************/
 
@@ -59,13 +631,13 @@ void dng_semantic_mask::CalcMaskSubArea (dng_point &origin,
 										 dng_rect &wholeImageArea) const
 	{
 
-	origin.v = (int32) fMaskSubArea [0];	 // top
-	origin.h = (int32) fMaskSubArea [1];	 // left
+	origin.v = ConvertUint32ToInt32 (fMaskSubArea [0]);	 // top
+	origin.h = ConvertUint32ToInt32 (fMaskSubArea [1]);	 // left
 
 	wholeImageArea.t = (int32) 0;
 	wholeImageArea.l = (int32) 0;
-	wholeImageArea.b = (int32) fMaskSubArea [3]; // height
-	wholeImageArea.r = (int32) fMaskSubArea [2]; // width
+	wholeImageArea.b = ConvertUint32ToInt32 (fMaskSubArea [3]); // height
+	wholeImageArea.r = ConvertUint32ToInt32 (fMaskSubArea [2]); // width
 	
 	}
 
@@ -81,22 +653,29 @@ bool dng_semantic_mask::IsMaskSubAreaValid () const
 		return false;
 		}
 
-	dng_point origin;
-
-	dng_rect wholeImageArea;
-
-	CalcMaskSubArea (origin, wholeImageArea);
-
 	const dng_point maskSize = fMask->Bounds ().Size ();
 
-	dng_rect crop;
+	// CR-4208475 Q-M8: Validate untrusted unsigned geometry before narrowing
+	// or constructing signed rectangle endpoints.
 
-	crop.t = origin.v;
-	crop.l = origin.h;
-	crop.b = origin.v + maskSize.v;
-	crop.r = origin.h + maskSize.h;
+	if (fMaskSubArea [0] > (uint32) INT32_MAX ||
+		fMaskSubArea [1] > (uint32) INT32_MAX ||
+		fMaskSubArea [2] > (uint32) INT32_MAX ||
+		fMaskSubArea [3] > (uint32) INT32_MAX ||
+		maskSize.v <= 0 ||
+		maskSize.h <= 0)
+		{
+		return false;
+		}
 
-	if ((crop & wholeImageArea) != crop)
+	const uint64 cropBottom =
+		SafeUint64Add (fMaskSubArea [0], (uint32) maskSize.v);
+
+	const uint64 cropRight =
+		SafeUint64Add (fMaskSubArea [1], (uint32) maskSize.h);
+
+	if (cropBottom > fMaskSubArea [3] ||
+		cropRight > fMaskSubArea [2])
 		{
 		return false;
 		}
@@ -729,15 +1308,27 @@ void dng_metadata::SetEmbeddedXMP (dng_host &host,
 								   const void *buffer,
 								   uint32 count)
 	{
+
+	dng_md5_direct_printer printer;
+
+	printer.ProcessPtr (buffer, count);
+
+	SetEmbeddedXMP (host, buffer, count, printer.Result ());
+
+	}
+
+/*****************************************************************************/
+
+void dng_metadata::SetEmbeddedXMP (dng_host &host,
+								   const void *buffer,
+								   uint32 count,
+								   const dng_fingerprint &sourceDigest)
+	{
 	
 	if (SetXMP (host, buffer, count))
 		{
-		
-		dng_md5_direct_printer printer;
-		
-		printer.ProcessPtr (buffer, count);
-		
-		fEmbeddedXMPDigest = printer.Result ();
+
+		fEmbeddedXMPDigest = sourceDigest;
 		
 		// Remove any sidecar specific tags from embedded XMP.
 		
@@ -1337,9 +1928,12 @@ uint32 dng_negative::ProfileCount () const
 
 const dng_camera_profile & dng_negative::ProfileByIndex (uint32 index) const
 	{
+
+	// CR-4208475 Q-L11: This is a public release-build precondition, not a
+	// debug-only invariant.
 	
-	DNG_ASSERT (index < ProfileCount (),
-				"Invalid index for ProfileByIndex");
+	DNG_REQUIRE (index < ProfileCount () && fCameraProfile [index] != NULL,
+				 "Invalid index for ProfileByIndex");
 				
 	return *fCameraProfile [index];
 		
@@ -1371,10 +1965,11 @@ bool dng_negative::GetProfileByMetadata
 					dng_camera_profile &foundProfile) const
 	{
 	
-	if (metadata.fIndex >= 0)
+	if (metadata.fIndex >= 0 &&
+		(uint32) metadata.fIndex < ProfileCount ())
 		{
 		
-		foundProfile = ProfileByIndex (metadata.fIndex);
+		foundProfile = ProfileByIndex ((uint32) metadata.fIndex);
 		
 		return true;
 		
@@ -4073,21 +4668,49 @@ void dng_negative::PostParse (dng_host &host,
 		if (shared.fXMPCount)
 			{
 
-			if (shared.fXMPCount > kMaxEmbeddedXMPBlockSize)
+			dng_big_table_dictionary originalDictionary =
+				Metadata ().BigTableDictionary ();
+
+			dng_big_table_dictionary dictionary = originalDictionary;
+
+			dng_fingerprint sourceDigest;
+
+			AutoPtr<dng_memory_block> block (ReadEmbeddedXMPBlock (host,
+																   stream,
+																   shared.fXMPOffset,
+																   shared.fXMPCount,
+																   dictionary,
+																   sourceDigest));
+
+			Metadata ().SetBigTableDictionary (dictionary);
+
+			try
 				{
-				ThrowBadFormat ("XMP block too large");
+
+				if (sourceDigest.IsValid ())
+					Metadata ().SetEmbeddedXMP (host,
+												 block->Buffer (),
+												 block->LogicalSize (),
+												 sourceDigest);
+
+				else
+					Metadata ().SetEmbeddedXMP (host,
+												 block->Buffer (),
+												 block->LogicalSize ());
+
 				}
-			
-			AutoPtr<dng_memory_block> block (host.Allocate (shared.fXMPCount));
-			
-			stream.SetReadPosition (shared.fXMPOffset);
-			
-			stream.Get (block->Buffer	   (),
-						block->LogicalSize ());
-						
-			Metadata ().SetEmbeddedXMP (host,
-										block->Buffer	   (),
-										block->LogicalSize ());
+
+			catch (...)
+				{
+
+				Metadata ().SetBigTableDictionary (originalDictionary);
+
+				throw;
+
+				}
+
+			if (!Metadata ().HaveValidEmbeddedXMP ())
+				Metadata ().SetBigTableDictionary (originalDictionary);
 										
 			#if qDNGValidate
 			
@@ -6670,10 +7293,17 @@ void dng_negative::LosslessCompressJXL (dng_host &host,
 		{
 		
 		AutoPtr<dng_jxl_image> lossyImage (new dng_jxl_image);
-		
+
+		// CR-4208475 R-M2: Encode the enhanced (stage 3) image here, matching
+		// this block's use_case_EnhancedImage intent and the raw-image block's
+		// use of RawImage (). The prior operand *RawTransparencyMask () was a
+		// copy-paste error: it dereferences a null pointer when the negative
+		// has no transparency mask (the guard above does not require one), and
+		// encodes the wrong pixels when a mask does exist.
+
 		lossyImage->Encode (host,
 							writer,
-							*RawTransparencyMask (),
+							*Stage3Image (),
 							nearLosslessOK ? dng_host::use_case_EnhancedImage
 										   : dng_host::use_case_LosslessEnhancedImage,
 							this);

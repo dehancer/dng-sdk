@@ -16,6 +16,7 @@
 #include "dng_host.h"
 #include "dng_local_string.h"
 #include "dng_memory.h"
+#include "dng_mutex.h"
 #include "dng_string.h"
 #include "dng_string_list.h"
 #include "dng_utils.h"
@@ -64,6 +65,9 @@ const char *XMP_NS_CRS		  = "http://ns.adobe.com/camera-raw-settings/1.0/";
 const char *XMP_NS_CRSS		  = "http://ns.adobe.com/camera-raw-saved-settings/1.0/";
 const char *XMP_NS_CRD		  = "http://ns.adobe.com/camera-raw-defaults/1.0/";
 const char *XMP_NS_CRLCP	  = "http://ns.adobe.com/camera-raw-embedded-lens-profile/1.0/";
+const char *XMP_NS_CRGI		  = "http://ns.adobe.com/camera-raw-group-info/1.0/";
+const char *XMP_NS_CRVC		  = "http://ns.adobe.com/camera-raw-virtual-copy/1.0/";
+const char *XMP_NS_CRCO		  = "http://ns.adobe.com/camera-raw-custom-order/1.0/";
 
 const char *XMP_NS_VFS        = "http://ns.adobe.com/video-foundation-settings/1.0/";
 
@@ -186,6 +190,17 @@ dng_xmp_private::dng_xmp_private (const dng_xmp_private &xmp)
 		
 /*****************************************************************************/
 
+// CR-4208475 Q-M4: Serialize process-wide XMP lifecycle changes and prevent
+// termination while an SDK wrapper owns live XMP metadata.
+
+typedef std::lock_guard<std::recursive_mutex> dng_xmp_lifecycle_lock;
+
+static std::recursive_mutex gXMPLifecycleMutex;
+static bool gInitializedXMP = false;
+static uint32 gXMPMetaCount = 0;
+
+/*****************************************************************************/
+
 dng_xmp_sdk::dng_xmp_sdk ()
 
 	:	fPrivate (NULL)
@@ -198,7 +213,7 @@ dng_xmp_sdk::dng_xmp_sdk ()
 		{
 		ThrowMemoryFull ();
 		}
-			
+
 	}
 		
 /*****************************************************************************/
@@ -208,12 +223,19 @@ dng_xmp_sdk::dng_xmp_sdk (const dng_xmp_sdk &sdk)
 	:	fPrivate (NULL)
 	
 	{
-	
+
+	dng_xmp_lifecycle_lock lock (gXMPLifecycleMutex);
+
 	fPrivate = new dng_xmp_private (*sdk.fPrivate);
 	
 	if (!fPrivate)
 		{
 		ThrowMemoryFull ();
+		}
+
+	if (fPrivate->fMeta)
+		{
+		gXMPMetaCount++;
 		}
 	
 	}
@@ -222,9 +244,18 @@ dng_xmp_sdk::dng_xmp_sdk (const dng_xmp_sdk &sdk)
 
 dng_xmp_sdk::~dng_xmp_sdk ()
 	{
+
+	dng_xmp_lifecycle_lock lock (gXMPLifecycleMutex);
 	
 	if (fPrivate)
 		{
+
+		if (fPrivate->fMeta)
+			{
+			DNG_REQUIRE (gXMPMetaCount > 0, "Invalid XMP metadata count");
+			gXMPMetaCount--;
+			}
+
 		delete fPrivate;
 		}
 	
@@ -232,13 +263,11 @@ dng_xmp_sdk::~dng_xmp_sdk ()
 
 /*****************************************************************************/
 
-static bool gInitializedXMP = false;
-
-/*****************************************************************************/
-
 void dng_xmp_sdk::InitializeSDK (dng_xmp_namespace * extraNamespaces,
 								 const char *software)
 	{
+
+	dng_xmp_lifecycle_lock lock (gXMPLifecycleMutex);
 	
 	if (!gInitializedXMP)
 		{
@@ -300,6 +329,42 @@ void dng_xmp_sdk::InitializeSDK (dng_xmp_namespace * extraNamespaces,
 											 "crlcp",
 											 &ss);
 				
+				}
+
+			// Register Camera Raw group information namespace.
+
+				{
+
+				TXMP_STRING_TYPE ss ("");
+
+				SXMPMeta::RegisterNamespace (XMP_NS_CRGI,
+											 "crgi",
+											 &ss);
+
+				}
+
+			// Register Camera Raw virtual-copy namespace.
+
+				{
+
+				TXMP_STRING_TYPE ss ("");
+
+				SXMPMeta::RegisterNamespace (XMP_NS_CRVC,
+											 "crvc",
+											 &ss);
+
+				}
+
+			// Register Camera Raw custom-order namespace.
+
+				{
+
+				TXMP_STRING_TYPE ss ("");
+
+				SXMPMeta::RegisterNamespace (XMP_NS_CRCO,
+											 "crco",
+											 &ss);
+
 				}
 				
 			// Register VideoFoundation namespace
@@ -510,21 +575,45 @@ void dng_xmp_sdk::InitializeSDK (dng_xmp_namespace * extraNamespaces,
 
 void dng_xmp_sdk::TerminateSDK ()
 	{
+
+	dng_xmp_lifecycle_lock lock (gXMPLifecycleMutex);
 	
 	if (gInitializedXMP)
 		{
-		
+
+		// CR-4210035: Never throw from here. TerminateSDK runs during process
+		// shutdown from a noexcept destructor chain (cr_sdk_terminate ->
+		// ~cr_initialize_terminate_ptr), so any exception that escapes becomes
+		// std::terminate/abort. A host app may still own live objects (an open
+		// cr_context and its cr_negative) that hold XMP metadata when it tears
+		// down cr_sdk, so a nonzero count is an expected shutdown state, not a
+		// programming error. Tearing the toolkit down while wrappers are still
+		// live could also leave those wrappers pointing at a destroyed toolkit,
+		// so we refuse the teardown and leave the toolkit initialized. We
+		// assert in debug so genuine leaks are still caught by cr_validate, but
+		// we never throw.
+
+		if (gXMPMetaCount != 0)
+			{
+
+			DNG_ASSERT (gXMPMetaCount == 0,
+						"XMP termination with active metadata");
+
+			return;
+
+			}
+
 		try
 			{
-			
+
 			#if qDNGXMPFiles
-			
+
 			SXMPFiles::Terminate ();
-			
+
 			#endif
-		
+
 			SXMPMeta::Terminate ();
-		
+
 			}
 			
 		catch (...)
@@ -558,6 +647,8 @@ bool dng_xmp_sdk::HasMeta () const
 
 void dng_xmp_sdk::ClearMeta ()
 	{
+
+	dng_xmp_lifecycle_lock lock (gXMPLifecycleMutex);
 	
 	if (HasMeta ())
 		{
@@ -565,6 +656,10 @@ void dng_xmp_sdk::ClearMeta ()
 		delete fPrivate->fMeta;
 		
 		fPrivate->fMeta = NULL;
+
+		DNG_REQUIRE (gXMPMetaCount > 0, "Invalid XMP metadata count");
+
+		gXMPMetaCount--;
 	
 		}
 		
@@ -574,6 +669,8 @@ void dng_xmp_sdk::ClearMeta ()
 
 void dng_xmp_sdk::MakeMeta ()
 	{
+
+	dng_xmp_lifecycle_lock lock (gXMPLifecycleMutex);
 	
 	ClearMeta ();
 	
@@ -590,6 +687,8 @@ void dng_xmp_sdk::MakeMeta ()
 			ThrowMemoryFull ();
 			
 			}
+
+		gXMPMetaCount++;
 		
 		}
 	

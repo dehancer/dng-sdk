@@ -87,6 +87,31 @@ static int32 NegateStepChecked (int32 step)
 
 /*****************************************************************************/
 
+static bool CanCoalesceStep (int32 outerStep,
+							 uint32 innerCount,
+							 int32 innerStep)
+	{
+
+	int32 innerCount32 = 0;
+
+	if (!ConvertUint32ToInt32 (innerCount, &innerCount32))
+		{
+		return false;
+		}
+
+	int32 coalescedStep = 0;
+
+	if (!SafeInt32Mult (innerCount32, innerStep, &coalescedStep))
+		{
+		return false;
+		}
+
+	return outerStep == coalescedStep;
+
+	}
+
+/*****************************************************************************/
+
 void OptimizeOrder (const void *&sPtr,
 					void *&dPtr,
 					uint32 sPixelSize,
@@ -317,17 +342,25 @@ void OptimizeOrder (const void *&sPtr,
 	dStep1 = step [index1];
 	dStep2 = step [index2];
 	
-	if (sStep0 == ((int32) count1) * sStep1 &&
-		dStep0 == ((int32) count1) * dStep1)
+	// CR-4208475 P-L1: These final coalescing checks are an optimization.
+	// If the step product or combined loop count cannot be represented,
+	// leave the dimensions split instead of evaluating signed-overflow math.
+
+	uint32 coalescedCount = 0;
+
+	if (CanCoalesceStep (sStep0, count1, sStep1) &&
+		CanCoalesceStep (dStep0, count1, dStep1) &&
+		SafeUint32Mult (count1, count0, &coalescedCount))
 		{
-		count1 *= count0;
+		count1 = coalescedCount;
 		count0 = 1;
 		}
 	
-	if (sStep1 == ((int32) count2) * sStep2 &&
-		dStep1 == ((int32) count2) * dStep2)
+	if (CanCoalesceStep (sStep1, count2, sStep2) &&
+		CanCoalesceStep (dStep1, count2, dStep2) &&
+		SafeUint32Mult (count2, count1, &coalescedCount))
 		{
-		count2 *= count1;
+		count2 = coalescedCount;
 		count1 = 1;
 		}
 	
@@ -1681,14 +1714,48 @@ bool dng_pixel_buffer::EqualArea (const dng_pixel_buffer &src,
 								  uint32 plane,
 								  uint32 planes) const
 	{
-	
+
+	// CR-4208475 R-L4: Validate the compared area and plane interval against
+	// both buffers before indexing pixels. ConstPixel's internal bounds check
+	// is compiled out, so an out-of-range plane/planes value forwarded by a
+	// public caller would otherwise read past the backing allocations. Mirrors
+	// the area/plane DNG_REQUIRE guards in CopyArea.
+
+	if (planes == 0)
+		{
+		return true;
+		}
+
+	DNG_REQUIRE ((area & src.Area ()) == area,
+				 "EqualArea: area OOB src");
+
+	DNG_REQUIRE ((area &     Area ()) == area,
+				 "EqualArea: area OOB dst");
+
+		{
+
+		uint32 endPlane = plane + planes;
+
+		DNG_REQUIRE (plane < endPlane,
+					 "EqualArea: planes overflow");
+
+		DNG_REQUIRE (src.fPlane <= plane &&
+					 endPlane <= src.fPlane + src.fPlanes,
+					 "EqualArea: src planes range");
+
+		DNG_REQUIRE (    fPlane <= plane &&
+					 endPlane <=     fPlane +     fPlanes,
+					 "EqualArea: dst planes range");
+
+		}
+
 	uint32 rows = area.H ();
 	uint32 cols = area.W ();
-	
+
 	const void *sPtr = src.ConstPixel (area.t,
 									   area.l,
 									   plane);
-								  
+
 	const void *dPtr = ConstPixel (area.t,
 								   area.l,
 								   plane);
@@ -1708,8 +1775,8 @@ bool dng_pixel_buffer::EqualArea (const dng_pixel_buffer &src,
 			{
 			
 			return DoEqualBytes (sPtr,
-								 dPtr, 
-								 planes * fPixelSize);
+								 dPtr,
+								 SafeUint32Mult (planes, fPixelSize));
 			
 			}
 			
@@ -1909,10 +1976,41 @@ real64 dng_pixel_buffer::MaximumDifference (const dng_pixel_buffer &rhs,
 											uint32 plane,
 											uint32 planes) const
 	{
-	
+
+	// CR-4208475 R-L4: Validate the compared area and plane interval against
+	// both buffers before indexing pixels (see EqualArea).
+
+	if (planes == 0)
+		{
+		return 0.0;
+		}
+
+	DNG_REQUIRE ((area & rhs.Area ()) == area,
+				 "MaximumDifference: area OOB src");
+
+	DNG_REQUIRE ((area &     Area ()) == area,
+				 "MaximumDifference: area OOB dst");
+
+		{
+
+		uint32 endPlane = plane + planes;
+
+		DNG_REQUIRE (plane < endPlane,
+					 "MaximumDifference: planes overflow");
+
+		DNG_REQUIRE (rhs.fPlane <= plane &&
+					 endPlane <= rhs.fPlane + rhs.fPlanes,
+					 "MaximumDifference: src planes range");
+
+		DNG_REQUIRE (    fPlane <= plane &&
+					 endPlane <=     fPlane +     fPlanes,
+					 "MaximumDifference: dst planes range");
+
+		}
+
 	uint32 rows = area.H ();
 	uint32 cols = area.W ();
-	
+
 	const void *s1Ptr = rhs.ConstPixel (area.t,
 										area.l,
 										plane);

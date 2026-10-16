@@ -91,7 +91,21 @@ class dng_big_table_cache
 									   const dng_fingerprint &fingerprint,
 									   dng_big_table &table) = 0;
 
-		virtual void Clear ()
+		// Unlike every other path in this class (CacheIncrement ()/
+		// CacheDecrement ()/CacheAdd ()/CacheExtract (), all of which only
+		// ever remove an entry once its reference count reaches zero),
+		// this unconditionally wipes fRefCounts regardless of any
+		// outstanding live references. That is only safe to call when no
+		// dng_big_table with fCache set to this cache is still alive --
+		// in practice this means it is only intended to be called from
+		// test code (e.g. via dng_big_table_cache_clear ()) to force a
+		// subsequent read to bypass the cache, not from production code
+		// paths that may still have live tables referencing this cache.
+		// A still-live table's later CacheIncrement ()/CacheDecrement ()
+		// call will report "fingerprint not in cache" as a harmless
+		// consequence -- see those functions' comments.
+
+		virtual void CacheClear (dng_lock_std_mutex & /* lock */)
 			{
 
 			fRefCounts.clear ();
@@ -103,6 +117,8 @@ class dng_big_table_cache
 	public:
 
 		virtual ~dng_big_table_cache ();
+
+		void Clear ();
 
 		void FlushRecentlyUsed ();
 
@@ -140,6 +156,20 @@ dng_big_table_cache::dng_big_table_cache ()
 
 dng_big_table_cache::~dng_big_table_cache ()
 	{
+
+	}
+
+/*****************************************************************************/
+
+void dng_big_table_cache::Clear ()
+	{
+
+	// CR-4208475 Q-L7: Serialize both base and derived cache clearing with
+	// normal cache access. The lock remains held across virtual dispatch.
+
+	dng_lock_std_mutex lock (fMutex);
+
+	CacheClear (lock);
 
 	}
 
@@ -229,6 +259,17 @@ void dng_big_table_cache::CacheIncrement (dng_lock_std_mutex &lock,
 		if (it == fRefCounts.end ())
 			{
 
+			// This is expected (and harmless) if Clear () was called while
+			// this fingerprint still had a live registered reference --
+			// e.g. test code forcing a cache reset via
+			// dng_big_table_cache_clear (). Clear () deliberately does not
+			// respect outstanding reference counts when it wipes
+			// fRefCounts, unlike every other path in this class, so a
+			// still-live table's later CacheIncrement () call (e.g. from a
+			// copy constructor) has nothing left to find here. This does
+			// not indicate any actual fRefCounts/derived-cache-data
+			// inconsistency.
+
 			DNG_REPORT ("dng_big_table_cache::CacheIncrement"
 						"fingerprint not in cache");
 
@@ -260,6 +301,16 @@ void dng_big_table_cache::CacheDecrement (dng_lock_std_mutex &lock,
 
 		if (it == fRefCounts.end ())
 			{
+
+			// This is expected (and harmless) if Clear () was called while
+			// this fingerprint still had a live registered reference --
+			// e.g. test code forcing a cache reset via
+			// dng_big_table_cache_clear (). Clear () deliberately does not
+			// respect outstanding reference counts when it wipes
+			// fRefCounts, unlike every other path in this class, so a
+			// still-live table's later CacheDecrement () call has nothing
+			// left to find here. This does not indicate any actual
+			// fRefCounts/derived-cache-data inconsistency.
 
 			DNG_REPORT ("dng_big_table_cache::CacheDecrement"
 						"fingerprint not in cache");
@@ -439,10 +490,10 @@ class dng_look_table_cache : public dng_big_table_cache
 			{
 			}
 
-		virtual void Clear ()
+		virtual void CacheClear (dng_lock_std_mutex &lock)
 			{
 
-			dng_big_table_cache::Clear ();
+			dng_big_table_cache::CacheClear (lock);
 
 			fTableData.clear ();
 
@@ -541,10 +592,10 @@ class dng_rgb_table_cache : public dng_big_table_cache
 			{
 			}
 
-		virtual void Clear ()
+		virtual void CacheClear (dng_lock_std_mutex &lock)
 			{
 
-			dng_big_table_cache::Clear ();
+			dng_big_table_cache::CacheClear (lock);
 
 			fTableData.clear ();
 
@@ -631,10 +682,10 @@ class dng_image_table_cache : public dng_big_table_cache
 
 	public:
 
-		void Clear () override
+		void CacheClear (dng_lock_std_mutex &lock) override
 			{
 
-			dng_big_table_cache::Clear ();
+			dng_big_table_cache::CacheClear (lock);
 
 			fTableData.clear ();
 
@@ -744,10 +795,10 @@ class dng_packed_image_table_cache : public dng_big_table_cache
 
 	public:
 
-		void Clear () override
+		void CacheClear (dng_lock_std_mutex &lock) override
 			{
 
-			dng_big_table_cache::Clear ();
+			dng_big_table_cache::CacheClear (lock);
 
 			fEntries.clear ();
 
@@ -1171,76 +1222,45 @@ bool dng_big_table::DecodeFromBinary (dng_host &host,
 
 /*****************************************************************************/
 
+static uint32 DecodeBigTableASCIICharacter (uint8 ch)
+	{
+
+	// This binary to text encoding is very similar to the Z85 encoding, but
+	// the exact character set has been adjusted to encode more cleanly in XMP.
+
+	static const uint8 kDecodeTable [96] =
+		{
+
+		0xFF, 0x44, 0xFF, 0x54, 0x53, 0x52, 0xFF, 0x49,
+		0x4B, 0x4C, 0x46, 0x41, 0xFF, 0x3F, 0x3E, 0x45,
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x40, 0xFF, 0xFF, 0x42, 0xFF, 0x47,
+		0x51, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A,
+		0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32,
+		0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A,
+		0x3B, 0x3C, 0x3D, 0x4D, 0xFF, 0x4E, 0x43, 0xFF,
+		0x48, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+		0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+		0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+		0x21, 0x22, 0x23, 0x4F, 0x4A, 0x50, 0xFF, 0xFF
+
+		};
+
+	if (ch < 32 || ch > 127)
+		return 0xFF;
+
+	return kDecodeTable [ch - 32];
+
+	}
+
+/*****************************************************************************/
+
 void dng_big_table::ASCIItoBinary (dng_memory_allocator &allocator,
 								   const char *sPtr,
 								   uint32 sCount,
 								   AutoPtr<dng_memory_block> &dBlock,
 								   uint32 &dCount)
 	{
-	
-	// This binary to text encoding is very similar to the Z85
-	// encoding, but the exact character set has been adjusted to
-	// encode more cleanly into XMP.
-
-	static uint8 kDecodeTable [96] =
-		{
-
-		0xFF,	// space
-		0x44,	// !
-		0xFF,	// "
-		0x54,	// #
-		0x53,	// $
-		0x52,	// %
-		0xFF,	// &
-		0x49,	// '
-		0x4B,	// (
-		0x4C,	// )
-		0x46,	// *
-		0x41,	// +
-		0xFF,	// ,
-		0x3F,	// -
-		0x3E,	// .
-		0x45,	// /
-
-		0x00, 0x01, 0x02, 0x03, 0x04,	// 01234
-		0x05, 0x06, 0x07, 0x08, 0x09,	// 56789
-
-		0x40,	// :
-		0xFF,	// ;
-		0xFF,	// <
-		0x42,	// =
-		0xFF,	// >
-		0x47,	// ?
-		0x51,	// @
-
-		0x24, 0x25, 0x26, 0x27, 0x28,	// ABCDE
-		0x29, 0x2A, 0x2B, 0x2C, 0x2D,	// FGHIJ
-		0x2E, 0x2F, 0x30, 0x31, 0x32,	// KLMNO
-		0x33, 0x34, 0x35, 0x36, 0x37,	// PQRST
-		0x38, 0x39, 0x3A, 0x3B, 0x3C,	// UVWXY
-		0x3D,							// Z
-
-		0x4D,	// [
-		0xFF,	// backslash
-		0x4E,	// ]
-		0x43,	// ^
-		0xFF,	// _
-		0x48,	// `
-
-		0x0A, 0x0B, 0x0C, 0x0D, 0x0E,	// abcde
-		0x0F, 0x10, 0x11, 0x12, 0x13,	// fghij
-		0x14, 0x15, 0x16, 0x17, 0x18,	// klmno
-		0x19, 0x1A, 0x1B, 0x1C, 0x1D,	// pqrst
-		0x1E, 0x1F, 0x20, 0x21, 0x22,	// uvwxy
-		0x23,							// z
-
-		0x4F,	// {
-		0x4A,	// |
-		0x50,	// }
-		0xFF,	// ~
-		0xFF	// del
-
-		};
 		
 	dCount = 0;
 	
@@ -1257,14 +1277,7 @@ void dng_big_table::ASCIItoBinary (dng_memory_allocator &allocator,
 	for (uint32 j = 0; j < sCount; j++)
 		{
 
-		uint8 e = (uint8) sPtr [j];
-
-		if (e < 32 || e > 127)
-			{
-			continue;
-			}
-
-		uint32 d = kDecodeTable [e - 32];
+		uint32 d = DecodeBigTableASCIICharacter ((uint8) sPtr [j]);
 
 		if (d > 85)
 			{
@@ -1339,6 +1352,148 @@ void dng_big_table::ASCIItoBinary (dng_memory_allocator &allocator,
 		dCount++;
 
 		}
+
+		}
+
+/*****************************************************************************/
+
+void dng_big_table::ASCIItoBinary (dng_stream &stream,
+								   uint64 offset,
+								   uint32 count,
+								   uint32 maxDecodedSize,
+								   dng_ref_counted_block &block)
+	{
+
+	const uint32 kBufferSize = 64u * 1024u;
+
+	dng_memory_data buffer (kBufferSize);
+
+	uint32 validCount = 0;
+	uint32 remaining = count;
+	uint64 position = offset;
+
+	// Count meaningful characters first so the retained dictionary block is
+	// exact-sized rather than based on the larger encoded XMP representation.
+
+	while (remaining)
+		{
+
+		dng_abort_sniffer::SniffForAbort (stream.Sniffer ());
+
+		const uint32 readCount = Min_uint32 (remaining, kBufferSize);
+
+		stream.SetReadPosition (position);
+		stream.Get (buffer.Buffer (), readCount);
+
+		const uint8 *src = buffer.Buffer_uint8 ();
+
+		for (uint32 j = 0; j < readCount; j++)
+			{
+
+			if (DecodeBigTableASCIICharacter (src [j]) <= 85)
+				validCount = SafeUint32Add (validCount, 1u);
+
+			}
+
+		position += readCount;
+		remaining -= readCount;
+
+		}
+
+	const uint32 tailCount = validCount % 5;
+
+	uint32 decodedSize = SafeUint32Mult (validCount / 5, 4u);
+
+	if (tailCount > 1)
+		decodedSize = SafeUint32Add (decodedSize, tailCount - 1);
+
+	if (decodedSize > maxDecodedSize)
+		ThrowBadFormat ("Embedded XMP big tables too large");
+
+	block.Allocate (decodedSize);
+
+	if (!decodedSize)
+		return;
+
+	uint8 *dst = block.Buffer_uint8 ();
+	uint32 phase = 0;
+	uint32 value = 0;
+	remaining = count;
+	position = offset;
+
+	// Decode directly into the final reference-counted dictionary block. This
+	// avoids retaining a file-sized XMP string and a second decoded copy.
+
+	while (remaining)
+		{
+
+		dng_abort_sniffer::SniffForAbort (stream.Sniffer ());
+
+		const uint32 readCount = Min_uint32 (remaining, kBufferSize);
+
+		stream.SetReadPosition (position);
+		stream.Get (buffer.Buffer (), readCount);
+
+		const uint8 *src = buffer.Buffer_uint8 ();
+
+		for (uint32 j = 0; j < readCount; j++)
+			{
+
+			const uint32 d = DecodeBigTableASCIICharacter (src [j]);
+
+			if (d > 85)
+				continue;
+
+			phase++;
+
+			if (phase == 1)
+				value = d;
+
+			else if (phase == 2)
+				value += d * 85;
+
+			else if (phase == 3)
+				value += d * (85 * 85);
+
+			else if (phase == 4)
+				value += d * (85 * 85 * 85);
+
+			else
+				{
+
+				value += d * (85 * 85 * 85 * 85);
+
+				*dst++ = (uint8) (value      );
+				*dst++ = (uint8) (value >>  8);
+				*dst++ = (uint8) (value >> 16);
+				*dst++ = (uint8) (value >> 24);
+
+				phase = 0;
+
+				}
+
+			}
+
+		position += readCount;
+		remaining -= readCount;
+
+		}
+
+	if (phase > 1)
+		{
+
+		*dst++ = (uint8) value;
+
+		if (phase > 2)
+			*dst++ = (uint8) (value >> 8);
+
+		if (phase > 3)
+			*dst++ = (uint8) (value >> 16);
+
+		}
+
+	DNG_REQUIRE ((uint32) (dst - block.Buffer_uint8 ()) == decodedSize,
+				 "Unexpected embedded big table decoded size");
 
 	}
 
@@ -2458,8 +2613,18 @@ bool dng_rgb_table::GetStream (dng_stream &stream)
 	else if (data.fDimensions == 3)
 		{
 
+		// Bound 3D divisions on read by kMaxDivisions3D_InMemory, the same
+		// ceiling Set () (create), PutStream () (write), and .cube import
+		// enforce, so any 3D table the SDK can produce round-trips. This read
+		// guard historically used the smaller kMaxDivisions3D (32), stricter
+		// than the write path: a table with more than 32 divisions (for example
+		// a 64-cube .cube LUT) serialized fine but threw here on reload,
+		// silently dropping the LUT. The decode below sizes fSamples from
+		// fDivisions and indexes nopValue (sized to kMaxDivisions1D) safely
+		// across this range.
+
 		if (data.fDivisions < kMinDivisions3D ||
-			data.fDivisions > kMaxDivisions3D)
+			data.fDivisions > kMaxDivisions3D_InMemory)
 			{
 			ThrowBadFormat ("Invalid 3D divisions");
 			}
@@ -2595,6 +2760,40 @@ void dng_rgb_table::PutStream (dng_stream &stream,
 	{
 
 	DNG_REQUIRE (IsValid (), "Invalid RGB Table");
+
+	// Enforce the same division limits on write that Set () (create) and
+	// GetStream () (read) enforce, so we never serialize a table that cannot
+	// be read back. kMaxDivisions3D_InMemory bounds both the in-memory and the
+	// serialized 3D form (see dng_big_table.h). A violation means an oversized
+	// table was constructed through some path that bypassed Set (), so this is
+	// a program error rather than a bad-format condition.
+
+	if (fData.fDimensions == 1)
+		{
+
+		if (fData.fDivisions < kMinDivisions1D ||
+			fData.fDivisions > kMaxDivisions1D)
+			{
+			ThrowProgramError ("Bad 1D divisions");
+			}
+
+		}
+
+	else if (fData.fDimensions == 3)
+		{
+
+		if (fData.fDivisions < kMinDivisions3D ||
+			fData.fDivisions > kMaxDivisions3D_InMemory)
+			{
+			ThrowProgramError ("Bad 3D divisions");
+			}
+
+		}
+
+	else
+		{
+		ThrowProgramError ("Bad dimensions");
+		}
 
 	stream.Put_uint32 (btt_RGBTable);
 
@@ -5623,6 +5822,12 @@ void MoveBigTablesToDictionary (dng_xmp &xmp,
 					  XMP_NS_CRSS,
 					  nullptr,
 					  true);
+
+	xmp.IteratePaths (MoveBigTablesToDictionaryCallback,
+					  (void *) &context,
+					  XMP_NS_CRVC,
+					  nullptr,
+					  true);
 	
 	}
 
@@ -5655,6 +5860,7 @@ void DualParseXMP (dng_host &host,
 	
 	dng_string ns_crs  ("crs:");
 	dng_string ns_crss ("crss:");
+	dng_string ns_crvc ("crvc:");
 
 	// Search for big tables in XMP using fast search.
 		
@@ -5687,10 +5893,16 @@ void DualParseXMP (dng_host &host,
 			{
 			
 			TableEntry entry;
+
+			// CR-4208475 Q-L2: Validate forward distances as offsets before
+			// forming pointers into an exactly sized caller allocation.
+
+			const size_t searchOffset = (size_t) (search - blockString);
+			const size_t searchBytes  = (size_t) blockSize - searchOffset;
 			
 			// Is the search result followed by a valid hex encoded fingerprint?
 			
-			if (search + 6 + 32 > blockString + blockSize)
+			if (searchBytes < 6 + 32)
 				{
 				break;		// Too near end of xmp block to even fit fingerprint
 				}
@@ -5715,15 +5927,17 @@ void DualParseXMP (dng_host &host,
 				
 				}
 				
-			// Look for big tables in both the XMP_NS_CRS and XMP_NS_CRSS
-			// namespaces.
+			// Look for big tables in the edit, saved-settings, and
+			// Virtual Copy namespaces.
 			
 			bool foundTable = false;
 			
-			for (uint32 nsIndex = 0; nsIndex < 2; nsIndex++)
+			for (uint32 nsIndex = 0; nsIndex < 3; nsIndex++)
 				{
 				
-				dng_string ns = (nsIndex == 0 ? ns_crs : ns_crss);
+				const dng_string &ns = nsIndex == 0
+					? ns_crs
+					: (nsIndex == 1 ? ns_crss : ns_crvc);
 				
 				int32 nsLength = ns.Length ();
 					
@@ -5737,7 +5951,7 @@ void DualParseXMP (dng_host &host,
 					 search [-nsLength - 1] == '\t' ||
 					 search [-nsLength - 1] == '\n' ||
 					 search [-nsLength - 1] == '\r') &&
-					search + 6 + 32 + 2 < blockString + blockSize &&
+					searchBytes > 6 + 32 + 2 &&
 					memcmp (search + 6 + 32, "=\"", 2) == 0)
 					{
 					
@@ -5771,7 +5985,7 @@ void DualParseXMP (dng_host &host,
 				if (search >= blockString + nsLength + 1 &&
 					memcmp (search - nsLength, ns.Get (), nsLength) == 0 &&
 					search [-nsLength - 1] == '<' &&
-					search + 6 + 32 + 1 < blockString + blockSize &&
+					searchBytes > 6 + 32 + 1 &&
 					search [6 + 32] == '>')
 					{
 					

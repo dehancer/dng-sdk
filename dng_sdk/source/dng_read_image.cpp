@@ -967,6 +967,10 @@ class dng_image_spooler: public dng_spooler,
 			
 		virtual void Spool (const void *data,
 							uint32 count);
+
+		// CR-4208475 S-H1: require every decoded byte to reach the image.
+
+		void Finish ();
 							
 	};
 
@@ -1106,6 +1110,19 @@ void dng_image_spooler::Spool (const void *data,
 
 		}
 	
+	}
+
+/*****************************************************************************/
+
+void dng_image_spooler::Finish ()
+	{
+
+	if (fBufferCount != 0 ||
+		fTileStrip.t != fTileArea.b)
+		{
+		ThrowBadFormat ();
+		}
+
 	}
 
 /*****************************************************************************/
@@ -1920,6 +1937,8 @@ bool dng_read_image::ReadLosslessJPEG (dng_host &host,
 						  bug16,
 						  tileOffset + tileByteCount);
 
+	spooler.Finish ();
+
 	return true;
 	
 	}
@@ -1944,6 +1963,18 @@ bool dng_read_image::ReadJXL (dng_host &host,
 	decoder.fNeedImage       = true;
 	decoder.fUsePixelBuffer  = true;
 	decoder.fUseSingleThread = usingMultipleThreads;
+
+	decoder.fValidatePixelBuffer = true;
+
+	decoder.fExpectedPixelBufferSize	  = tileArea.Size ();
+	decoder.fExpectedPixelBufferPlanes   = image.Planes ();
+	decoder.fExpectedPixelBufferPixelType = image.PixelType ();
+
+	decoder.fExpectedPixelBufferByteCount =
+		ComputeBufferSize (image.PixelType (),
+						   tileArea.Size (),
+						   image.Planes (),
+						   padNone);
 		
 	if (!jxlCompressedRawBitStream)
 		{
@@ -3164,7 +3195,15 @@ void dng_read_tiles_task::ProcessTask (uint32 tileIndex,
 
 		dng_md5_direct_printer printer;
 
-		printer.ProcessPtr (compressedBuffer->Buffer (),
+		// CR-4208475 R-L1: For a lossy image the tile bytes live in
+		// fLossyImage->fData [tileIndex]; compressedBuffer is only allocated
+		// when fLossyImage is null (see Process). Select the same buffer used
+		// to build tileStream below, or this dereferences an empty shared_ptr
+		// when a caller requests both a lossy image and a tile digest.
+
+		printer.ProcessPtr (fLossyImage
+								? fLossyImage->fData [tileIndex]->Buffer ()
+								: compressedBuffer->Buffer (),
 							byteCount);
 
 		fLossyTileDigest [tileIndex] = printer.Result ();
